@@ -11,6 +11,17 @@ import pytz
 import json
 import bisect
 import numpy as np
+from backtest_orb_runner_helpers import (
+    prepare_backtest_data,
+    get_weekly_risk_percent,
+    process_pair_day,
+)
+from backtest_orb_setup_builder import (
+    build_high_setup_for_day,
+    build_low_setup_for_day,
+    select_entry_target_from_gate_and_39,
+)
+
 # Simple ANSI colors for terminal
 RESET = "\033[0m"
 GREEN = "\033[92m"
@@ -331,44 +342,14 @@ class BacktestEngine1HORB:
         t1: float,
         t15: float,
     ) -> Dict:
-        """
-        Selection rules:
-
-        BUY:
-        1) Gate NO TOUCH + 3.9 NO TOUCH -> Entry AT,  Target T15
-        2) Gate NO TOUCH + 3.9 TOUCH    -> Entry AT,  Target T05
-        3) Gate TOUCH                   -> Entry T1,  Target T15
-
-        SELL:
-        1) Gate NO TOUCH + 3.9 NO TOUCH -> Entry AT,  Target T15
-        2) Gate NO TOUCH + 3.9 TOUCH    -> Entry AT,  Target T05
-        3) Gate TOUCH                   -> Entry T1,  Target T15
-        """
-        side = str(side).upper().strip()
-
-        t05 = round((float(at) + float(t1)) / 2.0, 5)
-
-        if gate_touched:
-            entry_price = float(t1)
-            tp_price = float(t15)
-            target_mode = "T15"
-            entry_mode = "BUY_T1" if side == "BUY" else "SELL_T1"
-        else:
-            entry_price = float(at)
-            if r39_touched:
-                tp_price = float(t05)
-                target_mode = "T05"
-            else:
-                tp_price = float(t15)
-                target_mode = "T15"
-            entry_mode = "BUY_AT" if side == "BUY" else "SELL_AT"
-
-        return {
-            "entry_price": round(entry_price, 5),
-            "tp_price": round(tp_price, 5),
-            "entry_mode": entry_mode,
-            "target_mode": target_mode,
-        }
+        return select_entry_target_from_gate_and_39(
+            side=side,
+            gate_touched=gate_touched,
+            r39_touched=r39_touched,
+            at=at,
+            t1=t1,
+            t15=t15,
+        )
 
     def _build_low_setup_for_day(
         self,
@@ -376,150 +357,12 @@ class BacktestEngine1HORB:
         fund: float,
         risk_percent: float,
     ) -> Optional[Dict]:
-        """
-        LOW-side pattern (BUY setup)
-
-        FINAL RULE:
-        - Base = global day low candle
-        - Breakout needed: close > low_high and HH wick-break
-        - Sustain window 1.5h; if new lower low appears -> invalid
-        - Gann input = low_high
-
-        Entry/Target selection:
-        1) Gate NO TOUCH + 3.9 NO TOUCH
-        -> Entry BUY_AT
-        -> Target T15
-
-        2) Gate NO TOUCH + 3.9 TOUCH
-        -> Entry BUY_AT
-        -> Target T05 = midpoint of AT and T1
-
-        3) Gate TOUCH
-        -> Entry BUY_T1
-        -> Target T15
-        """
-        if day_df.empty:
-            return None
-
-        day_df = day_df.sort_values("time").reset_index(drop=True)
-
-        min_idx = day_df["low"].idxmin()
-        low_row = day_df.loc[min_idx]
-
-        day_low = float(low_row["low"])
-        low_high = float(low_row["high"])
-        picked_time = low_row["time"]
-        low_atr = float(low_row.get("atr", 0.0))
-
-        if not np.isfinite(low_atr) or low_atr <= 0:
-            print("  -> LOW pattern: ATR invalid at day low, skip")
-            return None
-
-        breakout_idx = None
-        breakout_time = None
-        breakout_close = None
-
-        for j in range(min_idx + 1, len(day_df)):
-            r = day_df.iloc[j]
-            c = float(r["close"])
-            h = float(r["high"])
-            prev_high = float(day_df.iloc[j - 1]["high"]) if j > 0 else h
-
-            if c > low_high and h > low_high and h > prev_high:
-                breakout_idx = j
-                breakout_time = r["time"]
-                breakout_close = c
-                break
-
-        if breakout_idx is None:
-            print(
-                "  -> LOW pattern: no valid HH close-break > low_high after day low, skip")
-            return None
-
-        sustain_end_time = breakout_time + timedelta(minutes=15 * 6)
-        sustain_mask = (day_df["time"] > breakout_time) & (
-            day_df["time"] <= sustain_end_time)
-        sustain_df = day_df.loc[sustain_mask]
-
-        if not sustain_df.empty:
-            min_low_in_window = float(sustain_df["low"].min())
-            if min_low_in_window < day_low:
-                print(
-                    f"  -> LOW pattern: new lower low {min_low_in_window:.5f} "
-                    f"during sustain (base={day_low:.5f}), skip"
-                )
-                return None
-
-        gann_input = low_high
-        gann_levels = self._get_gann_from_lookup(gann_input)
-        if not gann_levels:
-            print("  -> Gann lookup failed for LOW pattern")
-            return None
-
-        levels = StrategyCalculator._extract_levels(gann_levels)
-
-        buy_at = float(levels["buy_at"])
-        buy_t1 = float(levels["buy_t1"])
-        buy_t15 = float(levels["buy_t15"])
-
-        gate_level = low_high + low_atr
-        r39_level = low_high + low_atr * 3.9
-
-        gate_touched = gate_level > buy_at
-        r39_touched = r39_level > buy_at
-
-        print(
-            f"  -> LOW DEBUG: low_high={low_high:.5f}, AT={buy_at:.5f}, "
-            f"gate_level={gate_level:.5f}, gate_touched={gate_touched}, "
-            f"r39_level={r39_level:.5f}, r39_touched={r39_touched}"
-        )
-
-        selection = self._select_entry_target_from_gate_and_39(
-            side="BUY",
-            gate_touched=gate_touched,
-            r39_touched=r39_touched,
-            at=buy_at,
-            t1=buy_t1,
-            t15=buy_t15,
-        )
-
-        sl_price = buy_at if selection["entry_mode"] == "BUY_T1" else float(
-            levels["sell_at"])
-
-        setup = StrategyCalculator.build_custom_setup(
-            side="B",
-            entry=float(selection["entry_price"]),
-            sl=sl_price,
-            tp=float(selection["tp_price"]),
+        return build_low_setup_for_day(
+            engine=self,
+            day_df=day_df,
             fund=fund,
             risk_percent=risk_percent,
-            pair=self.pair,
-            entry_mode=selection["entry_mode"],
-            target_mode=selection["target_mode"],
         )
-
-        setup["trigger_time"] = breakout_time
-        setup["picked_candle_time"] = picked_time
-        setup["breakout_candle_time"] = breakout_time
-        setup["breakout_close"] = breakout_close
-        setup["compare_level"] = low_high
-        setup["gate_level"] = round(gate_level, 5)
-        setup["r39_level"] = round(r39_level, 5)
-        setup["gate_touched"] = bool(gate_touched)
-        setup["r39_touched"] = bool(r39_touched)
-        setup["atr"] = round(low_atr, 5)
-
-        print(
-            f"  -> LOW pattern: picked_time={picked_time}, "
-            f"low={day_low:.5f}, high={low_high:.5f}, "
-            f"breakout_time={breakout_time}, breakout_close={breakout_close:.5f}, "
-            f"ATR={low_atr:.5f}, gate_level={gate_level:.5f}, gate_touched={gate_touched}, "
-            f"r39_level={r39_level:.5f}, r39_touched={r39_touched}, "
-            f"mode={setup['entry_mode']}, target_mode={setup['target_mode']}, "
-            f"entry={setup['entry']:.5f}, SL={setup['sl']:.5f}, TP={setup['tp']:.5f}"
-        )
-
-        return setup
 
     def _build_high_setup_for_day(
         self,
@@ -527,162 +370,12 @@ class BacktestEngine1HORB:
         fund: float,
         risk_percent: float,
     ) -> Optional[Dict]:
-        """
-        HIGH-side pattern (SELL setup)
-
-        FINAL RULE:
-        - Base = global day high candle
-        - Breakout needed: close < high_low and LL wick-break
-        - Sustain window 1.5h; if new higher high appears -> invalid
-        - Gann input = high_low
-
-        Entry/Target selection:
-        1) Gate NO TOUCH + 3.9 NO TOUCH
-        -> Entry SELL_AT
-        -> Target T15
-
-        2) Gate NO TOUCH + 3.9 TOUCH
-        -> Entry SELL_AT
-        -> Target T05 = midpoint of AT and T1
-
-        3) Gate TOUCH
-        -> Entry SELL_T1
-        -> Target T15
-        """
-        if day_df.empty:
-            return None
-
-        day_df = day_df.sort_values("time").reset_index(drop=True)
-
-        max_idx = day_df["high"].idxmax()
-        high_row = day_df.loc[max_idx]
-
-        day_high = float(high_row["high"])
-        high_low = float(high_row["low"])
-        picked_time = high_row["time"]
-
-        high_atr = float(high_row.get("atr", 0.0))
-        if not np.isfinite(high_atr) or high_atr <= 0:
-            found_atr = None
-            for k in range(max_idx - 1, -1, -1):
-                atr_val = float(day_df.iloc[k].get("atr", 0.0))
-                if np.isfinite(atr_val) and atr_val > 0:
-                    found_atr = atr_val
-                    break
-            if found_atr is not None:
-                high_atr = found_atr
-                print(
-                    f"  -> HIGH pattern: ATR at day high invalid, using previous valid ATR={high_atr:.5f}"
-                )
-            else:
-                print("  -> HIGH pattern: no valid ATR found before day high, skip")
-                return None
-
-        breakout_idx = None
-        breakout_time = None
-        breakout_close = None
-
-        for j in range(max_idx + 1, len(day_df)):
-            r = day_df.iloc[j]
-            c = float(r["close"])
-            l = float(r["low"])
-            prev_low = float(day_df.iloc[j - 1]["low"]) if j > 0 else l
-
-            if c < high_low and l < high_low and l < prev_low:
-                breakout_idx = j
-                breakout_time = r["time"]
-                breakout_close = c
-                break
-
-        if breakout_idx is None:
-            print(
-                "  -> HIGH pattern: no valid LL close-break < high_low after day high, skip")
-            return None
-
-        sustain_end_time = breakout_time + timedelta(minutes=15 * 6)
-        sustain_mask = (day_df["time"] > breakout_time) & (
-            day_df["time"] <= sustain_end_time)
-        sustain_df = day_df.loc[sustain_mask]
-
-        if not sustain_df.empty:
-            max_high_in_window = float(sustain_df["high"].max())
-            if max_high_in_window > day_high:
-                print(
-                    f"  -> HIGH pattern: new higher high {max_high_in_window:.5f} "
-                    f"during sustain (base={day_high:.5f}), skip"
-                )
-                return None
-
-        gann_input = high_low
-        gann_levels = self._get_gann_from_lookup(gann_input)
-        if not gann_levels:
-            print("  -> Gann lookup failed for HIGH pattern")
-            return None
-
-        levels = StrategyCalculator._extract_levels(gann_levels)
-
-        sell_at = float(levels["sell_at"])
-        sell_t1 = float(levels["sell_t1"])
-        sell_t15 = float(levels["sell_t15"])
-
-        gate_level = high_low - high_atr
-        r39_level = high_low - high_atr * 3.9
-
-        gate_touched = gate_level < sell_at
-        r39_touched = r39_level < sell_at
-
-        print(
-            f"  -> HIGH DEBUG: high_low={high_low:.5f}, AT={sell_at:.5f}, "
-            f"gate_level={gate_level:.5f}, gate_touched={gate_touched}, "
-            f"r39_level={r39_level:.5f}, r39_touched={r39_touched}"
-        )
-
-        selection = self._select_entry_target_from_gate_and_39(
-            side="SELL",
-            gate_touched=gate_touched,
-            r39_touched=r39_touched,
-            at=sell_at,
-            t1=sell_t1,
-            t15=sell_t15,
-        )
-
-        sl_price = sell_at if selection["entry_mode"] == "SELL_T1" else float(
-            levels["buy_at"])
-
-        setup = StrategyCalculator.build_custom_setup(
-            side="S",
-            entry=float(selection["entry_price"]),
-            sl=sl_price,
-            tp=float(selection["tp_price"]),
+        return build_high_setup_for_day(
+            engine=self,
+            day_df=day_df,
             fund=fund,
             risk_percent=risk_percent,
-            pair=self.pair,
-            entry_mode=selection["entry_mode"],
-            target_mode=selection["target_mode"],
         )
-
-        setup["trigger_time"] = breakout_time
-        setup["picked_candle_time"] = picked_time
-        setup["breakout_candle_time"] = breakout_time
-        setup["breakout_close"] = breakout_close
-        setup["compare_level"] = high_low
-        setup["gate_level"] = round(gate_level, 5)
-        setup["r39_level"] = round(r39_level, 5)
-        setup["gate_touched"] = bool(gate_touched)
-        setup["r39_touched"] = bool(r39_touched)
-        setup["atr"] = round(high_atr, 5)
-
-        print(
-            f"  -> HIGH pattern: picked_time={picked_time}, "
-            f"high={day_high:.5f}, low={high_low:.5f}, "
-            f"breakout_time={breakout_time}, breakout_close={breakout_close:.5f}, "
-            f"ATR={high_atr:.5f}, gate_level={gate_level:.5f}, gate_touched={gate_touched}, "
-            f"r39_level={r39_level:.5f}, r39_touched={r39_touched}, "
-            f"mode={setup['entry_mode']}, target_mode={setup['target_mode']}, "
-            f"entry={setup['entry']:.5f}, SL={setup['sl']:.5f}, TP={setup['tp']:.5f}"
-        )
-
-        return setup
 
     def _wait_for_entry_in_window(
         self,
@@ -1362,65 +1055,17 @@ class BacktestEngine1HORB:
         return trade_record
 
     def run_backtest(self, specs) -> None:
-        """
-        specs: list of dicts:
-        [
-            {"pair": "EURAUD.ecn", "csv": "EURAUD_H1.csv"},
-            {"pair": "GBPAUD.ecn", "csv": "GBPAUD_H1.csv"},
-            ...
-        ]
-        Shared fund across all pairs.
-
-        NEW FLOW:
-        - Global min_date..max_date nikalo (START_DATE/END_DATE ke andar)
-        - Har day ke liye sab pairs loop
-        - Har pair/day pe NEW Day High/Low pattern process karo
-        """
-        # 1) Sare CSV load + date range collect
-        data_by_pair = {}
-        all_dates = set()
+        data_by_pair, all_dates = prepare_backtest_data(self, specs)
 
         self.daily_briefings = []
         self.long_duration_trades = []
-
-        for spec in specs:
-            pair = spec["pair"]
-            csv_path = spec["csv"]
-
-            df = pd.read_csv(csv_path)
-            df["time"] = pd.to_datetime(df["datetime"])
-            df = df.sort_values("time").reset_index(drop=True)
-
-            # 1) ALWAYS compute ATR on full data first (for warm-up)
-            if "atr" not in df.columns:
-                df = self._add_atr_column(df)
-
-            # 2) THEN apply date filter only for backtest range,
-            #    but keep full df in memory for ATR / context
-            full_df = df.copy()
-
-            if self.start_date is not None:
-                df = df[df["time"].dt.date >= self.start_date]
-            if self.end_date is not None:
-                df = df[df["time"].dt.date <= self.end_date]
-
-            if df.empty:
-                continue
-
-            # Store both full_df (for ATR, M1 windows etc.) and filtered df
-            data_by_pair[pair] = full_df
-            all_dates.update(df["time"].dt.date.unique())
 
         if not data_by_pair or not all_dates:
             print("No data available for given specs/date range.")
             return
 
-        # 2) Global date range (sorted)
-        all_dates = sorted(all_dates)
-
         print(f"\nTotal unique days in range: {len(all_dates)}")
 
-        # 3) Main loop: per day -> per pair
         for day in all_dates:
             print("\n" + "=" * 60)
             print(f"PROCESSING DAY: {day}")
@@ -1436,314 +1081,56 @@ class BacktestEngine1HORB:
                 if getattr(self, "stop_requested", False):
                     break
 
-                day_mask = df["time"].dt.date == day
-                day_df = df.loc[day_mask].copy()
-                if day_df.empty:
-                    continue
-
-                # YAHAN: day_df pe ATR ensure + forward fill
-                if "atr" not in day_df.columns:
-                    # Agar full df pe ATR missing hai to pehle wahan add karo
-                    if "atr" not in df.columns:
-                        df = self._add_atr_column(df)
-                        data_by_pair[pair] = df  # update back
-                    # Ab dobara slice lo, ATR ke saath
-                    day_df = df[df["time"].dt.date == day].copy()
-
-                # ATR ko forward-fill karo (agar kisi bar me NaN ho)
-                day_df["atr"] = day_df["atr"].ffill()
-
-                self.pair = pair
-                print("\n" + "-" * 40)
-                print(f"[{pair}] Processing: {day}")
-                print(f"Current Fund: ${self.current_fund:.2f}")
-
-                if not self._validate_day(day_df):
-                    print("  -> Day invalid, skipping")
-                    continue
-
-                # Weekly risk ramp
-                if self.start_date is not None:
-                    week_num = ((day - self.start_date).days // 7) + 1
-                else:
-                    week_num = 1
-
-                raw_risk_percent = self.base_risk_percent + \
-                    (week_num - 1) * 0.5
-                risk_percent = min(raw_risk_percent, 5.0)
+                week_num, risk_percent = get_weekly_risk_percent(self, day)
                 day_risk_percent = risk_percent
 
-                print(f"  -> Week {week_num}: Risk={risk_percent:.1f}%")
+                trades = process_pair_day(self, day, pair, df)
 
-                raw_fund = self.current_fund
-                print(f"  -> Sizing Fund: ${raw_fund:,.2f}")
-
-                # ===== NEW DAY HIGH/LOW LOGIC =====
-                print("\n" + "-" * 30)
-                print("  -> New Day High/Low pattern processing")
-
-                high_setup = self._build_high_setup_for_day(
-                    day_df=day_df,
-                    fund=raw_fund,
-                    risk_percent=risk_percent,
-                )
-
-                low_setup = self._build_low_setup_for_day(
-                    day_df=day_df,
-                    fund=raw_fund,
-                    risk_percent=risk_percent,
-                )
-
-                candidates = []
-                if high_setup:
-                    candidates.append(high_setup)
-                if low_setup:
-                    candidates.append(low_setup)
-
-                if not candidates:
-                    print("  -> No valid Day High/Low setup for this day")
-                    continue
-
-                # Sab potential setups ko trigger_time ke hisaab se sort karo
-                candidates.sort(key=lambda s: s["trigger_time"])
-
-                # Ek time pe sirf 1 active trade allowed
-                active_trade_open = False
-                last_exit_time = None
-
-                for setup in candidates:
-                    if getattr(self, "stop_requested", False):
-                        break
-
-                    side = setup["side"]
-                    trigger_time = setup["trigger_time"]
-
-                    # Agar previous trade ka exit_time hai aur ye usse pehle trigger hua hai,
-                    # to isko skip (ye purane window ka pattern hoga)
-                    if last_exit_time is not None and trigger_time <= last_exit_time:
-                        print(
-                            f"  -> HOLD setup side={side} trigger={trigger_time} "
-                            f"because trigger <= last exit {last_exit_time}"
-                        )
-                        continue
-
-                    # Agar koi trade abhi open hai to next setup hold karo
-                    if active_trade_open:
-                        print(
-                            f"  -> HOLD setup side={side} trigger={trigger_time} "
-                            f"because previous trade still open"
-                        )
-                        continue
-
-                    print(
-                        f"  -> Chosen setup: side={side}, "
-                        f"picked_candle_time={setup.get('picked_candle_time')}, "
-                        f"trigger_time={trigger_time}, "
-                        f"breakout_time={setup.get('breakout_candle_time')}, "
-                        f"breakout_close={setup.get('breakout_close')}, "
-                        f"compare_level={setup.get('compare_level')}, "
-                        f"entry_mode={setup.get('entry_mode')}, "
-                        f"entry={setup['entry']:.5f}, SL={setup['sl']:.5f}, TP={setup['tp']:.5f}"
-                    )
-
-                    entry_level = float(setup["entry"])
-                    sl = float(setup["sl"])
-                    tp = float(setup["tp"])
-                    lot = float(setup["lot_size"])
-
-                    # ---- ENTRY SEARCH ----
-                    mask = day_df["time"] >= trigger_time
-                    search_df = day_df.loc[mask].copy()
-
-                    if search_df.empty:
-                        print(
-                            f"  -> {side} no candles after trigger_time, skip")
-                        continue
-
-                    entry_idx = None
-                    for idx, row in search_df.iterrows():
-                        h = float(row["high"])
-                        l = float(row["low"])
-                        if side == "B" and h >= entry_level:
-                            entry_idx = idx
-                            break
-                        if side == "S" and l <= entry_level:
-                            entry_idx = idx
-                            break
-
-                    if entry_idx is None:
-                        print(f"  -> {side} pending not filled for the day")
-                        continue
-
-                    print(
-                        f"  -> {side} Entry filled at {df.loc[entry_idx, 'time']}, "
-                        f"price={entry_level:.5f}"
-                    )
-
-                    sim_setup = {
-                        "side": side,
-                        "sl": sl,
-                        "tp": tp,
-                        "lot_size": lot,
-                        "entry_mode": setup.get("entry_mode", ""),
-                    }
-
-                    active_trade_open = True
-
-                    trade = self._simulate_trade(
-                        df=df,
-                        setup=sim_setup,
-                        entry_idx=entry_idx,
-                        actual_entry=entry_level,
-                    )
-
-                    active_trade_open = False
-                    last_exit_time = trade["exit_time"]
-                    day_max_lot = max(day_max_lot, float(lot))
-
-                    print(
-                        f"  -> {side} Exit {trade['result']} at {trade['exit_time']}, "
-                        f"price={trade['exit_price']:.5f}, "
-                        f"PNL=${trade['pnl_amount']:.2f}, Fund=${trade['fund_after']:.2f}"
-                    )
-
+                for trade in trades:
                     day_trade_count += 1
-                    day_profit += trade["pnl_amount"]
+                    day_profit += float(trade["pnl_amount"])
+                    day_max_lot = max(day_max_lot, float(
+                        trade.get("lot_size", 0.0)))
+
                     if trade["result"] == "tp":
                         day_tp_hits += 1
 
-                    if trade and trade.get("entry_time") and trade.get("exit_time"):
-                        duration = trade["exit_time"] - trade["entry_time"]
-                        if duration > timedelta(hours=2):
-                            self.long_duration_trades.append(
-                                {
-                                    "date": trade["entry_time"].date(),
-                                    "pair": trade.get("pair", self.pair),
-                                    "side": trade.get("side", side),
-                                    "entry_time": trade["entry_time"],
-                                    "exit_time": trade["exit_time"],
-                                    "duration_hours": round(
-                                        duration.total_seconds() / 3600, 2
-                                    ),
-                                }
-                            )
+                    duration_hours = (
+                        pd.to_datetime(trade["exit_time"]) -
+                        pd.to_datetime(trade["entry_time"])
+                    ).total_seconds() / 3600.0
 
-                    if getattr(self, "stop_requested", False):
-                        print(
-                            YELLOW
-                            + "  -> Global stop triggered (fund <= 0), terminating backtest"
-                            + RESET
-                        )
-                        break
+                    if duration_hours > 2:
+                        enriched_trade = dict(trade)
+                        enriched_trade["duration_hours"] = round(
+                            duration_hours, 2)
+                        self.long_duration_trades.append(enriched_trade)
 
-            self.daily_briefings.append(
-                {
-                    "date": day,
-                    "open_balance": round(day_open_balance, 2),
-                    "risk_percent": round(day_risk_percent, 2) if day_risk_percent is not None else 0.0,
-                    "no_trades": day_trade_count,
-                    "tp_hits": day_tp_hits,
-                    "max_lot": round(day_max_lot, 2),
-                    "profit": round(day_profit, 2),
-                    "final_balance": round(self.current_fund, 2),
-                }
+            day_close_balance = self.current_fund
+            self.daily_briefings.append({
+                "date": day,
+                "open_balance": round(day_open_balance, 2),
+                "close_balance": round(day_close_balance, 2),
+                "profit": round(day_profit, 2),
+                "trade_count": day_trade_count,
+                "tp_hits": day_tp_hits,
+                "risk_percent": day_risk_percent,
+                "max_lot": round(day_max_lot, 2),
+            })
+
+            print(
+                f"DAY SUMMARY | {day} | "
+                f"Open=${day_open_balance:.2f} | "
+                f"Close=${day_close_balance:.2f} | "
+                f"PnL=${day_profit:.2f} | "
+                f"Trades={day_trade_count} | "
+                f"TP={day_tp_hits} | "
+                f"MaxLot={day_max_lot:.2f}"
             )
 
             if getattr(self, "stop_requested", False):
+                print(" -> Stop requested, backtest halted.")
                 break
-
-        # ---------- FINAL STATS (with SL_BE) ----------
-        wins = sum(1 for t in self.trades if t["result"] == "tp")
-        sl_lock10 = sum(1 for t in self.trades if t["result"] == "sl_lock10")
-        losses = sum(1 for t in self.trades if t["result"] == "sl")
-
-        if self.total_trades > 0:
-            # Win rate: TP / total trades (BE included in denominator, but not numerator)
-            self.win_rate = wins / self.total_trades * 100.0
-
-        print(
-            f"\nTOTAL TRADES: {self.total_trades}, "
-            f"WINS (TP): {wins}, SL_LOCK10: {sl_lock10}, LOSSES (SL): {losses}"
-        )
-
-        print(
-            f"FINAL FUND: ${self.current_fund:,.2f} "
-            f"({self._human_amount(self.current_fund)})"
-        )
-
-        print("\n=== DAY WISE BRIEFING ===")
-        for idx, d in enumerate(self.daily_briefings, start=1):
-            print(
-                f"Day: {idx} | Date: {d['date']} | "
-                f"Open Bal: ${d['open_balance']:,.2f} | "
-                f"Risk%: {d['risk_percent']:.2f}% | "
-                f"No Trades: {d['no_trades']} | "
-                f"TP Hits: {d['tp_hits']} | "
-                f"Max Lot: {d['max_lot']:.2f} | "
-                f"Profit: ${d['profit']:,.2f} | "
-                f"Final Balance: ${d['final_balance']:,.2f}"
-            )
-
-        print("\n=== LONG DURATION TRADES (> 2 hours) ===")
-        if self.long_duration_trades:
-            print("DATE / PAIR / SIDE / ENTRY TIME / EXIT TIME / DURATION_HOURS")
-            for t in self.long_duration_trades:
-                print(
-                    f"{t['date']} / {t['pair']} / {t['side']} / "
-                    f"{t['entry_time']} / {t['exit_time']} / {t['duration_hours']}"
-                )
-        else:
-            print("None")
-
-        print("\n=== MAXIMUM LOSS WHILE OPEN (MAE) TRADES ===")
-        mae_trades = [
-            t for t in self.trades
-            if "max_adverse_amount" in t and t["max_adverse_amount"] is not None
-        ]
-
-        if not mae_trades:
-            print("No MAE data available (did you paste updated _simulate_trade?)")
-            return
-
-        mae_trades_sorted = sorted(
-            mae_trades,
-            key=lambda x: (
-                x.get("date"),
-                -float(x.get("max_adverse_amount", 0.0))
-            ),
-        )
-
-        print(
-            "DATE / PAIR / SIDE / RESULT / BAL_BEFORE / MAE_AMOUNT / MAE_PIPS / MIN_AVAIL_BAL / ENTRY_TIME / EXIT_TIME"
-        )
-        for t in mae_trades_sorted:
-            line = (
-                f"{t['date']} / {t['pair']} / {t['side']} / {t['result']} / "
-                f"${t.get('balance_before_trade', 0.0):,.2f} / "
-                f"${t.get('max_adverse_amount', 0.0):,.2f} / "
-                f"{t.get('max_adverse_pips', 0.0):.1f} / "
-                f"${t.get('min_available_balance_during_trade', 0.0):,.2f} / "
-                f"{t.get('entry_time')} / {t.get('exit_time')}"
-            )
-
-            if float(t.get("min_available_balance_during_trade", 0.0)) < 0:
-                print(RED + line + RESET)
-            else:
-                print(line)
-
-        # >>> LAST BLOCK: HUMAN SUMMARY <<<
-        last_lot = (
-            self.trades[-1].get("lot_size", 0.0)
-            if self.trades else 0.0
-        )
-
-        print(
-            f'\nSUMMARY: Executed {self.total_trades} trades '
-            f'({wins} TP, {sl_lock10} SL_LOCK10, {losses} SL), final fund '
-            f'${self.current_fund:,.2f} '
-            f'({self._human_amount(self.current_fund)}), '
-            f'last lot {last_lot:.2f}.'
-        )
 
     def _human_amount(self, n: float) -> str:
         n = float(n)
