@@ -1,5 +1,7 @@
 from strategy_calculator import StrategyCalculator
 from gann_fetcher import GannFetcher
+from live_data_mt5 import fetch_live_1m
+from live_fund_manager import get_live_usable_fund
 import os
 import pandas as pd
 import numpy as np
@@ -8,11 +10,44 @@ from typing import List, Dict, Optional
 import pytz
 import json
 import bisect
+import numpy as np
 # Simple ANSI colors for terminal
 RESET = "\033[0m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
 CYAN = "\033[96m"
+RED = "\033[91m"
+
+TERMINAL_FILLED_STATUSES = {"FILLED_BUY", "FILLED_SELL", "BE_APPLIED"}
+
+TERMINAL_DEAD_STATUSES = {
+    "FAILED",
+    "CANCELLEDEOD",
+    "CANCELLEDNEWHHLL",
+    "EXPIRED",
+    "ORDEREXPIRED1930",
+}
+
+ACTIVE_FILE_STATUSES = {"NEW", "PLACED"}
+
+REGISTRY_DIR = "live_registry"
+REGISTRY_FILE = os.path.join(REGISTRY_DIR, "hl_live_registry.json")
+
+RESULT_TP = "tp"
+RESULT_SL = "sl"
+RESULT_SL_LOCK10 = "sl_lock10"
+RESULT_SESSION_EXIT = "session_exit"
+RESULT_ORDER_EXPIRED = "orderexpired1930"
+
+REGISTRY_STATUS_GENERATED = "GENERATED"
+REGISTRY_STATUS_COMPLETED = "COMPLETED"
+REGISTRY_STATUS_ENTRY_HIT = "ENTRY_HIT"
+REGISTRY_STATUS_CANCELLED_EOD = "CANCELLEDEOD"
+REGISTRY_STATUS_CANCELLED_NEW_HH_LL = "CANCELLEDNEWHHLL"
+REGISTRY_STATUS_ORDER_EXPIRED = "ORDEREXPIRED1930"
+
+COMPLETED_RESULTS = {RESULT_TP, RESULT_SL, RESULT_SL_LOCK10}
+NON_COMPLETED_RESULTS = {RESULT_ORDER_EXPIRED, RESULT_SESSION_EXIT}
 
 
 class DSTHelper:
@@ -62,9 +97,18 @@ class BacktestEngine1HORB:
     def __init__(self, initial_fund: float, initial_risk_percent: float, pair: str):
         self.initial_fund = initial_fund
         self.current_fund = initial_fund
-        self.initial_risk_percent = initial_risk_percent
-        self.base_risk_percent = initial_risk_percent  # weekly ramp ka base
+
+        # Script-se-controlled risk%
+        self.initial_risk_percent = float(initial_risk_percent)
+        self.base_risk_percent = float(
+            initial_risk_percent)  # weekly ramp ka base
+
         self.pair = pair
+
+        # ---- Live equity sizing config ----
+        self.use_live_equity_sizing = False
+        self.live_source_fund = None
+        self.live_strategy_start_fund = None
 
         # Date filter / weekly risk reference
         self.start_date = None
@@ -77,6 +121,9 @@ class BacktestEngine1HORB:
         self.win_rate = 0.0
         self.stop_requested = False
 
+        # NEW: final list for trades > 2 hours
+        self.long_duration_trades = []
+
         # Volatility filter
         self.atr_period = 14
         self.vol_ratio_threshold = 1.20  # < 1.20 = VALID
@@ -85,10 +132,23 @@ class BacktestEngine1HORB:
         self.entry_start_ist = time(7, 31)
         self.expire_ist = time(19, 30)
 
+        # SERVER-time HH/LL disable window:
+        # Detection allowed, but new order processing blocked in this window.
+        self.hhll_disable_start_server = time(11, 15)
+        self.hhll_disable_end_server = time(16, 45)
+
         # 🔹 Local Gann lookup load (JSON)
         self.gann_lookup = self._load_gann_lookup("forex_gann_lookup_1_3.json")
 
-    # ------------ EXTRA HELPERS FOR ORB SHIFT LOGIC ------------
+        # 🔹 OLD fixed-lot logic ko effectively disable kar do
+        # Saara lot sizing ab StrategyCalculator.calculate_lot_size ke through hoga
+        self.max_backtest_lot = None
+        self.fixed_lot_mode = False
+        self.fixed_lot_value = None
+
+        # summaries
+        self.daily_briefings = []
+        # ------------ EXTRA HELPERS FOR ORB SHIFT LOGIC ------------
 
     def _compute_bo_ratio(
         self, first_candle: pd.Series, bo_candle: pd.Series
@@ -103,12 +163,6 @@ class BacktestEngine1HORB:
 
         ratio = bo_hl / first_hl
         return ratio
-
-    def _should_shift_orb_to_930(
-        self, first_candle: pd.Series, bo_candle: pd.Series
-    ) -> bool:
-        ratio = self._compute_bo_ratio(first_candle, bo_candle)
-        return ratio >= 2.0
 
     # ----------------------------------------------------------------
 
@@ -222,608 +276,524 @@ class BacktestEngine1HORB:
         df["atr"] = atr
         return df
 
+    def _debug_atr_row(self, df: pd.DataFrame, ts):
+        row = df[df["time"] == pd.Timestamp(ts)]
+        if row.empty:
+            print(f"ATR DEBUG: no row for {ts}")
+            return
+
+        i = row.index[0]
+        prev_close = df.loc[i - 1, "close"] if i > 0 else np.nan
+        tr = max(
+            df.loc[i, "high"] - df.loc[i, "low"],
+            abs(df.loc[i, "high"] - prev_close) if pd.notna(prev_close) else 0,
+            abs(df.loc[i, "low"] - prev_close) if pd.notna(prev_close) else 0,
+        )
+
+        print(
+            f"ATR DEBUG | time={df.loc[i, 'time']} | "
+            f"high={df.loc[i, 'high']:.5f} low={df.loc[i, 'low']:.5f} "
+            f"close={df.loc[i, 'close']:.5f} prev_close={prev_close:.5f} "
+            f"TR={tr:.5f} ATR={df.loc[i, 'atr']:.5f}"
+        )
+
     # ------------------ DAY VALIDATION (basic) ------------------
 
     def _validate_day(self, day_df: pd.DataFrame) -> bool:
         """
-        Check: 00:00 candle exists and ATR available.
-        Naye ORB rules alag se chalenge.
+        New timed-session strategy validation:
+        - Day must have candles
+        - ATR column should exist
+        - At least some valid ATR values should be present
         """
         if day_df.empty:
             return False
 
-        day_date = day_df["time"].dt.date.iloc[0]
-        candle_time = datetime.combine(day_date, time(0, 0))
-
-        row = day_df[day_df["time"] == candle_time]
-        if row.empty:
-            print("  -> No 00:00 candle for this day (skipping)")
+        if "atr" not in day_df.columns:
+            print("  -> ATR column missing")
             return False
 
-        row = row.iloc[0]
-        first_atr = row.get("atr", np.nan)
+        valid_atr = day_df["atr"].dropna()
+        valid_atr = valid_atr[valid_atr > 0]
 
-        if pd.isna(first_atr) or first_atr <= 0:
-            print("  -> ATR not available/zero at 00:00 candle (skipping)")
+        if valid_atr.empty:
+            print("  -> ATR not available for this day")
             return False
 
         return True
 
-    def _decide_orb(self, day_df: pd.DataFrame) -> Dict:
-        """
-        3 rules sequence:
-        1) (00:00 H-L)/ATR > 1.00 -> shift 9:30
-        2) |00:00 O-C|/ATR > 1.00 -> shift 9:30
-        3) (BO_HL / first_HL) >= 2.00 -> shift 9:30
-        Agar tino fail -> ORB 00:00 hi.
-        Special: oc<0.30 + Rule3 fail -> first breakout candle as NEW ORB.
-        Returns: {"orb": {...}, "rule": 0/1/2/3/4/5, "breakout": breakout,
-                  "is_new_orb_shifted": bool}
-        """
-        day_date = day_df["time"].dt.date.iloc[0]
-        is_new_orb_shifted = False
-
-        # 00:00 ORB candle
-        orb_0000 = self._get_orb_marking(day_df)
-        if not orb_0000:
-            return {"orb": None, "rule": 0, "breakout": None, "is_new_orb_shifted": False}
-
-        # 00:00 row
-        first_pos = orb_0000["mark_idx"]
-        first_row = day_df.iloc[first_pos]
-        first_h = first_row["high"]
-        first_l = first_row["low"]
-        first_o = first_row["open"]
-        first_c = first_row["close"]
-        first_atr = first_row.get("atr", np.nan)
-
-        if pd.isna(first_atr) or first_atr <= 0:
-            print("  -> ATR not available/zero at 00:00, using 00:00 ORB only")
-            return {
-                "orb": orb_0000,
-                "rule": 0,
-                "breakout": None,
-                "is_new_orb_shifted": False,
-            }
-
-        print(f"  ==> DAY ATR14 (00:00) = {first_atr:.5f}")
-
-        # ---------- Rule 1: (H-L)/ATR > 1.00 ----------
-        hl_ratio = (first_h - first_l) / first_atr
-        print(f"  -> Rule1 (H-L/ATR) = {hl_ratio:.2f}")
-        if hl_ratio > 1.0:
-            rule_used = 1
-
-        else:
-            # ---------- Rule 2: |O-C|/ATR ----------
-            oc_ratio = abs(first_o - first_c) / first_atr
-            print(f"  -> Rule2 (|O-C|/ATR) = {oc_ratio:.2f}")
-
-            if oc_ratio > 1.0:
-                # Direct shift to 9:30
-                rule_used = 2
-
-            elif oc_ratio >= 0.30:
-                # 0.30–1.0 : normal Rule3 flow on 00:00 ORB
-                breakout_0000 = self._detect_breakout(day_df, orb_0000)
-                if not breakout_0000:
-                    print("  -> No breakout from 00:00 ORB for Rule3 check")
-                    return {
-                        "orb": orb_0000,
-                        "rule": 0,
-                        "breakout": None,
-                        "is_new_orb_shifted": False,
-                    }
-
-                bo_pos = breakout_0000["index"]
-                bo_row = day_df.iloc[bo_pos]
-
-                first_hl = first_h - first_l
-                bo_hl = bo_row["high"] - bo_row["low"]
-                if first_hl <= 0 or bo_hl <= 0:
-                    print("  -> Invalid HL values for Rule3")
-                    return {
-                        "orb": orb_0000,
-                        "rule": 0,
-                        "breakout": breakout_0000,
-                        "is_new_orb_shifted": False,
-                    }
-
-                bo_ratio = bo_hl / first_hl
-                print(f"  -> Rule3 (BO_HL/First_HL) = {bo_ratio:.2f}")
-                if bo_ratio >= 2.0:
-                    rule_used = 3
-                else:
-                    # tino fail -> 00:00 ORB hi
-                    return {
-                        "orb": orb_0000,
-                        "rule": 0,
-                        "breakout": breakout_0000,
-                        "is_new_orb_shifted": False,
-                    }
-
-            else:
-                # oc_ratio < 0.30  -> SPECIAL FLOW
-                # Pehle 00:00 ORB par Rule3 check karo
-                breakout_0000 = self._detect_breakout(day_df, orb_0000)
-                if not breakout_0000:
-                    print("  -> No breakout from 00:00 ORB for Rule3 check (oc<0.30)")
-                    return {
-                        "orb": orb_0000,
-                        "rule": 0,
-                        "breakout": None,
-                        "is_new_orb_shifted": False,
-                    }
-
-                bo_pos = breakout_0000["index"]
-                bo_row = day_df.iloc[bo_pos]
-
-                first_hl = first_h - first_l
-                bo_hl = bo_row["high"] - bo_row["low"]
-                if first_hl <= 0 or bo_hl <= 0:
-                    print("  -> Invalid HL values for Rule3 (oc<0.30)")
-                    return {
-                        "orb": orb_0000,
-                        "rule": 0,
-                        "breakout": breakout_0000,
-                        "is_new_orb_shifted": False,
-                    }
-
-                bo_ratio = bo_hl / first_hl
-                print(f"  -> Rule3 (BO_HL/First_HL) = {bo_ratio:.2f}")
-
-                if bo_ratio >= 2.0:
-                    # Rule3 positive -> normal 9:30 shift
-                    rule_used = 3
-                else:
-                    # oc<0.30 AND 00:00 Rule3 fail -> first breakout candle as NEW ORB
-                    print(
-                        CYAN
-                        + "  -> Rule2<0.30 and Rule3 fail: using first breakout candle as NEW ORB"
-                        + RESET
-                    )
-
-                    new_orb_idx = bo_pos
-                    new_orb_row = bo_row
-
-                    orb_new = {
-                        "high": new_orb_row["high"],
-                        "low": new_orb_row["low"],
-                        "mark_idx": int(new_orb_idx),
-                    }
-
-                    print(
-                        CYAN
-                        + f"  -> NEW ORB at {new_orb_row['time']} "
-                        f"H={new_orb_row['high']:.5f}, L={new_orb_row['low']:.5f}"
-                        + RESET
-                    )
-
-                    # NEW ORB ka breakout
-                    breakout_new = self._detect_breakout(day_df, orb_new)
-                    if not breakout_new:
-                        print("  -> No breakout from NEW ORB, skipping day")
-                        return {
-                            "orb": None,
-                            "rule": 0,
-                            "breakout": None,
-                            "is_new_orb_shifted": False,
-                        }
-
-                    bo_new_pos = breakout_new["index"]
-                    bo_new_row = day_df.iloc[bo_new_pos]
-
-                    # NEW ORB breakout time IST me
-                    bo_new_time_server = bo_new_row["time"]
-                    bo_new_time_ist = DSTHelper.server_to_ist(
-                        bo_new_time_server
-                    ).time()
-                    if bo_new_time_ist > time(9, 30):
-                        print(
-                            YELLOW
-                            + f"  -> NEW ORB breakout at {bo_new_time_ist} IST (>09:30), skipping this day"
-                            + RESET
-                        )
-                        # Day completely skip
-                        return {
-                            "orb": None,
-                            "rule": 0,
-                            "breakout": None,
-                            "is_new_orb_shifted": False,
-                        }
-
-                    # Ratio NEW ORB par
-                    new_orb_hl = orb_new["high"] - orb_new["low"]
-                    bo_new_hl = bo_new_row["high"] - bo_new_row["low"]
-
-                    if new_orb_hl <= 0 or bo_new_hl <= 0:
-                        return {
-                            "orb": orb_new,
-                            "rule": 5,
-                            "breakout": breakout_new,
-                            "is_new_orb_shifted": False,
-                        }
-
-                    new_bo_ratio = bo_new_hl / new_orb_hl
-                    print(
-                        f"  -> Rule3(NEW_ORB) (BO_HL/ORB_HL) = {new_bo_ratio:.2f}"
-                    )
-
-                    if new_bo_ratio >= 2.0:
-                        # NEW ORB strong -> 9:30 shift flow use karega (rule_used = 5)
-                        rule_used = 5
-                        is_new_orb_shifted = True
-                        # aur aage 9:30 shift block chalega
-                        orb_0000 = orb_new  # 9:30 shift ke base ke liye yahi ORB treat kar
-                    else:
-                        # NEW ORB normal -> direct use, 9:30 shift nahi
-                        return {
-                            "orb": orb_new,
-                            "rule": 5,
-                            "breakout": breakout_new,
-                            "is_new_orb_shifted": False,
-                        }
-
-        # Yahan aate hi rule_used = 1/2/3/5 -> shift to 9:30 IST
-        target_930_ist = time(9, 30)
-        target_930_server = DSTHelper.ist_to_server(
-            datetime.combine(day_date, target_930_ist)
-        )
-        row_930 = day_df[day_df["time"] == target_930_server]
-        if row_930.empty:
-            print(YELLOW + "  -> 9:30 IST candle missing, cannot shift ORB" + RESET)
-            # fallback 00:00 ORB hi
-            return {
-                "orb": orb_0000,
-                "rule": 0,
-                "breakout": None,
-                "is_new_orb_shifted": False,
-            }
-
-        r = row_930.iloc[0]
-        orb_930 = {
-            "high": r["high"],
-            "low": r["low"],
-            "mark_idx": int(day_df.index.get_loc(row_930.index[0])),
-        }
-        print(
-            GREEN
-            + f"  -> ORB SHIFTED to 9:30 IST by Rule-{rule_used} "
-            f"H={r['high']:.5f}, L={r['low']:.5f}, ATR={r['atr']:.5f}"
-            + RESET
-        )
-
-        # 9:30 ORB se breakout nikaalte hain
-        breakout_930 = self._detect_breakout(day_df, orb_930)
-
-        # Rule-3 style check on 9:30 ORB → possible shift to 15:30 IST
-        if breakout_930 is not None:
-            bo_pos_930 = breakout_930["index"]
-            bo_row_930 = day_df.iloc[bo_pos_930]
-
-            orb930_hl = orb_930["high"] - orb_930["low"]
-            bo930_hl = bo_row_930["high"] - bo_row_930["low"]
-
-            if orb930_hl > 0 and bo930_hl > 0:
-                bo_ratio_930 = bo930_hl / orb930_hl
-                print(f"  -> Rule3(9:30) (BO_HL/ORB_HL) = {bo_ratio_930:.2f}")
-
-                if bo_ratio_930 >= 1.50:
-                    # shift ORB to 15:30 IST
-                    target_1530_ist = time(15, 30)
-                    target_1530_server = DSTHelper.ist_to_server(
-                        datetime.combine(day_date, target_1530_ist)
-                    )
-                    row_1530 = day_df[day_df["time"] == target_1530_server]
-                    if row_1530.empty:
-                        print(
-                            YELLOW
-                            + "  -> 15:30 IST candle missing, keeping 9:30 ORB"
-                            + RESET
-                        )
-                    else:
-                        r15 = row_1530.iloc[0]
-                        orb_1530 = {
-                            "high": r15["high"],
-                            "low": r15["low"],
-                            "mark_idx": int(day_df.index.get_loc(row_1530.index[0])),
-                        }
-                        print(
-                            GREEN
-                            + f"  -> ORB SHIFTED to 15:30 IST from 9:30 "
-                            f"H={r15['high']:.5f}, L={r15['low']:.5f}, ATR={r15['atr']:.5f}"
-                            + RESET
-                        )
-                        # final ORB & breakout re‑compute from 15:30
-                        orb_final = orb_1530
-                        breakout_final = self._detect_breakout(
-                            day_df, orb_final)
-                        return {
-                            "orb": orb_final,
-                            "rule": 4,
-                            "breakout": breakout_final,
-                            "is_new_orb_shifted": is_new_orb_shifted,
-                        }
-
-        # default: 9:30 ORB hi final
-        return {
-            "orb": orb_930,
-            "rule": rule_used,
-            "breakout": breakout_930,
-            "is_new_orb_shifted": is_new_orb_shifted,
-        }
-
-    # ------------------ MARKET TYPE INFERENCE (3:30 vs 2:30 window) ------------------
-
-    def _infer_market_type(self, day_df: pd.DataFrame) -> str:
-        """
-        Broker-specific session mapping (IST open 3:30 vs 2:30),
-        using hardcoded switch dates:
-
-        11 Mar 2024  -> 2:30
-        04 Nov 2024  -> 3:30
-        10 Mar 2025  -> 2:30
-        03 Nov 2025  -> 3:30
-        09 Mar 2026  -> 2:30
-        02 Nov 2026  -> 3:30
-        """
-
-        if day_df.empty:
-            return "3:30_window"
-
-        day_date = day_df["time"].dt.date.iloc[0]
-
-        # Hardcoded broker schedule (inclusive start dates)
-        # 2024
-        if datetime(2024, 3, 11).date() <= day_date < datetime(2024, 11, 4).date():
-            return "2:30_window"
-        if datetime(2024, 11, 4).date() <= day_date < datetime(2025, 3, 10).date():
-            return "3:30_window"
-
-        # 2025
-        if datetime(2025, 3, 10).date() <= day_date < datetime(2025, 11, 3).date():
-            return "2:30_window"
-        if datetime(2025, 11, 3).date() <= day_date < datetime(2026, 3, 9).date():
-            return "3:30_window"
-
-        # 2026
-        if datetime(2026, 3, 9).date() <= day_date < datetime(2026, 11, 2).date():
-            return "2:30_window"
-        if day_date >= datetime(2026, 11, 2).date():
-            return "3:30_window"
-
-        # For dates before Mar-2024 fall back to 3:30 (old regime)
-        return "3:30_window"
-
-    def _get_entry_expire_time(self, day: datetime.date, market_type: str) -> time:
-        """
-        Returns expiry time in IST: time(19, 30) or time(20, 30)
-        """
-        if market_type == "2:30_window":
-            return time(20, 30)
-        else:  # 3:30_window
-            return time(19, 30)
-
-    # ------------------ ORB MARKING (00:00) ------------------
-
-    def _get_orb_marking(self, day_df: pd.DataFrame) -> Optional[Dict]:
-        """
-        ORB = exact 00:00 1H candle high/low on server time.
-        """
-        day_date = day_df["time"].dt.date.iloc[0]
-        candle_time = datetime.combine(day_date, time(0, 0))
-
-        # Exact match
-        row_idx = day_df.index[day_df["time"] == candle_time]
-        if row_idx.empty:
-            print("  -> ORB 00:00 candle missing")
-            return None
-
-        idx = row_idx[0]
-        row = day_df.loc[idx]
-
-        print(
-            f"  -> ORB (00:00) H={row['high']:.5f}, L={row['low']:.5f} (idx={idx})"
-        )
-
-        return {
-            "high": row["high"],
-            "low": row["low"],
-            "mark_idx": int(day_df.index.get_loc(idx)),  # 0-based position
-        }
-
-    # ------------------ CLOSE BREAKOUT ------------------
-
-    def _detect_breakout(self, day_df: pd.DataFrame, orb: Dict) -> Optional[Dict]:
-        high_level = orb["high"]
-        low_level = orb["low"]
-        start_pos = orb["mark_idx"] + 1  # 00:00 ke baad wali candle se
-
-        for pos in range(start_pos, len(day_df)):
-            row = day_df.iloc[pos]
-            close = row["close"]
-
-            if close > high_level:
-                print(
-                    GREEN + f"  -> BUY BO at {row['time']} (close {close:.5f} > {high_level:.5f})" + RESET)
-                return {
-                    "side": "B",
-                    "bo_time": row["time"],
-                    "input_price": row["high"],
-                    "index": pos,
-                }
-
-            if close < low_level:
-                print(
-                    YELLOW + f"  -> SELL BO at {row['time']} (close {close:.5f} < {low_level:.5f})" + RESET)
-                return {
-                    "side": "S",
-                    "bo_time": row["time"],
-                    "input_price": row["low"],
-                    "index": pos,
-                }
-
-        print("  -> No close breakout for this day")
-        return None
-
-    # ------------------ ATR BUFFER ENTRY HELPER ------------------
-
-    def _check_atr_buffer_entry(
+    def _select_entry_target_from_gate_and_39(
         self,
-        entry_price: float,
         side: str,
-        atr: float,
-        high: float,
-        low: float,
-        is_new_orb_shifted: bool = False,
-    ) -> Optional[float]:
+        gate_touched: bool,
+        r39_touched: bool,
+        at: float,
+        t1: float,
+        t15: float,
+    ) -> Dict:
         """
-        ATR buffer entry:
-        NORMAL DAY:
-          - If ATR < 0.00150 -> ATR/7
-          - Else             -> ATR/10
+        Selection rules:
 
-        SPECIAL DAY (NEW ORB strong -> 9:30 shift, Rule-5):
-          - If ATR < 0.00150 -> ATR/5
-          - Else             -> ATR/7
+        BUY:
+        1) Gate NO TOUCH + 3.9 NO TOUCH -> Entry AT,  Target T15
+        2) Gate NO TOUCH + 3.9 TOUCH    -> Entry AT,  Target T05
+        3) Gate TOUCH                   -> Entry T1,  Target T15
 
-        BUY:  high >= entry + buffer -> fill at (entry + buffer)
-        SELL: low  <= entry - buffer -> fill at (entry - buffer)
+        SELL:
+        1) Gate NO TOUCH + 3.9 NO TOUCH -> Entry AT,  Target T15
+        2) Gate NO TOUCH + 3.9 TOUCH    -> Entry AT,  Target T05
+        3) Gate TOUCH                   -> Entry T1,  Target T15
         """
-        if atr is None or atr <= 0:
+        side = str(side).upper().strip()
+
+        t05 = round((float(at) + float(t1)) / 2.0, 5)
+
+        if gate_touched:
+            entry_price = float(t1)
+            tp_price = float(t15)
+            target_mode = "T15"
+            entry_mode = "BUY_T1" if side == "BUY" else "SELL_T1"
+        else:
+            entry_price = float(at)
+            if r39_touched:
+                tp_price = float(t05)
+                target_mode = "T05"
+            else:
+                tp_price = float(t15)
+                target_mode = "T15"
+            entry_mode = "BUY_AT" if side == "BUY" else "SELL_AT"
+
+        return {
+            "entry_price": round(entry_price, 5),
+            "tp_price": round(tp_price, 5),
+            "entry_mode": entry_mode,
+            "target_mode": target_mode,
+        }
+
+    def _build_low_setup_for_day(
+        self,
+        day_df: pd.DataFrame,
+        fund: float,
+        risk_percent: float,
+    ) -> Optional[Dict]:
+        """
+        LOW-side pattern (BUY setup)
+
+        FINAL RULE:
+        - Base = global day low candle
+        - Breakout needed: close > low_high and HH wick-break
+        - Sustain window 1.5h; if new lower low appears -> invalid
+        - Gann input = low_high
+
+        Entry/Target selection:
+        1) Gate NO TOUCH + 3.9 NO TOUCH
+        -> Entry BUY_AT
+        -> Target T15
+
+        2) Gate NO TOUCH + 3.9 TOUCH
+        -> Entry BUY_AT
+        -> Target T05 = midpoint of AT and T1
+
+        3) Gate TOUCH
+        -> Entry BUY_T1
+        -> Target T15
+        """
+        if day_df.empty:
             return None
 
-        # SPECIAL: NEW ORB strong -> 9:30 shift day
-        if is_new_orb_shifted:
-            if atr < 0.00150:
-                buffer_val = atr / 5.0
+        day_df = day_df.sort_values("time").reset_index(drop=True)
+
+        min_idx = day_df["low"].idxmin()
+        low_row = day_df.loc[min_idx]
+
+        day_low = float(low_row["low"])
+        low_high = float(low_row["high"])
+        picked_time = low_row["time"]
+        low_atr = float(low_row.get("atr", 0.0))
+
+        if not np.isfinite(low_atr) or low_atr <= 0:
+            print("  -> LOW pattern: ATR invalid at day low, skip")
+            return None
+
+        breakout_idx = None
+        breakout_time = None
+        breakout_close = None
+
+        for j in range(min_idx + 1, len(day_df)):
+            r = day_df.iloc[j]
+            c = float(r["close"])
+            h = float(r["high"])
+            prev_high = float(day_df.iloc[j - 1]["high"]) if j > 0 else h
+
+            if c > low_high and h > low_high and h > prev_high:
+                breakout_idx = j
+                breakout_time = r["time"]
+                breakout_close = c
+                break
+
+        if breakout_idx is None:
+            print(
+                "  -> LOW pattern: no valid HH close-break > low_high after day low, skip")
+            return None
+
+        sustain_end_time = breakout_time + timedelta(minutes=15 * 6)
+        sustain_mask = (day_df["time"] > breakout_time) & (
+            day_df["time"] <= sustain_end_time)
+        sustain_df = day_df.loc[sustain_mask]
+
+        if not sustain_df.empty:
+            min_low_in_window = float(sustain_df["low"].min())
+            if min_low_in_window < day_low:
+                print(
+                    f"  -> LOW pattern: new lower low {min_low_in_window:.5f} "
+                    f"during sustain (base={day_low:.5f}), skip"
+                )
+                return None
+
+        gann_input = low_high
+        gann_levels = self._get_gann_from_lookup(gann_input)
+        if not gann_levels:
+            print("  -> Gann lookup failed for LOW pattern")
+            return None
+
+        levels = StrategyCalculator._extract_levels(gann_levels)
+
+        buy_at = float(levels["buy_at"])
+        buy_t1 = float(levels["buy_t1"])
+        buy_t15 = float(levels["buy_t15"])
+
+        gate_level = low_high + low_atr
+        r39_level = low_high + low_atr * 3.9
+
+        gate_touched = gate_level > buy_at
+        r39_touched = r39_level > buy_at
+
+        print(
+            f"  -> LOW DEBUG: low_high={low_high:.5f}, AT={buy_at:.5f}, "
+            f"gate_level={gate_level:.5f}, gate_touched={gate_touched}, "
+            f"r39_level={r39_level:.5f}, r39_touched={r39_touched}"
+        )
+
+        selection = self._select_entry_target_from_gate_and_39(
+            side="BUY",
+            gate_touched=gate_touched,
+            r39_touched=r39_touched,
+            at=buy_at,
+            t1=buy_t1,
+            t15=buy_t15,
+        )
+
+        sl_price = buy_at if selection["entry_mode"] == "BUY_T1" else float(
+            levels["sell_at"])
+
+        setup = StrategyCalculator.build_custom_setup(
+            side="B",
+            entry=float(selection["entry_price"]),
+            sl=sl_price,
+            tp=float(selection["tp_price"]),
+            fund=fund,
+            risk_percent=risk_percent,
+            pair=self.pair,
+            entry_mode=selection["entry_mode"],
+            target_mode=selection["target_mode"],
+        )
+
+        setup["trigger_time"] = breakout_time
+        setup["picked_candle_time"] = picked_time
+        setup["breakout_candle_time"] = breakout_time
+        setup["breakout_close"] = breakout_close
+        setup["compare_level"] = low_high
+        setup["gate_level"] = round(gate_level, 5)
+        setup["r39_level"] = round(r39_level, 5)
+        setup["gate_touched"] = bool(gate_touched)
+        setup["r39_touched"] = bool(r39_touched)
+        setup["atr"] = round(low_atr, 5)
+
+        print(
+            f"  -> LOW pattern: picked_time={picked_time}, "
+            f"low={day_low:.5f}, high={low_high:.5f}, "
+            f"breakout_time={breakout_time}, breakout_close={breakout_close:.5f}, "
+            f"ATR={low_atr:.5f}, gate_level={gate_level:.5f}, gate_touched={gate_touched}, "
+            f"r39_level={r39_level:.5f}, r39_touched={r39_touched}, "
+            f"mode={setup['entry_mode']}, target_mode={setup['target_mode']}, "
+            f"entry={setup['entry']:.5f}, SL={setup['sl']:.5f}, TP={setup['tp']:.5f}"
+        )
+
+        return setup
+
+    def _build_high_setup_for_day(
+        self,
+        day_df: pd.DataFrame,
+        fund: float,
+        risk_percent: float,
+    ) -> Optional[Dict]:
+        """
+        HIGH-side pattern (SELL setup)
+
+        FINAL RULE:
+        - Base = global day high candle
+        - Breakout needed: close < high_low and LL wick-break
+        - Sustain window 1.5h; if new higher high appears -> invalid
+        - Gann input = high_low
+
+        Entry/Target selection:
+        1) Gate NO TOUCH + 3.9 NO TOUCH
+        -> Entry SELL_AT
+        -> Target T15
+
+        2) Gate NO TOUCH + 3.9 TOUCH
+        -> Entry SELL_AT
+        -> Target T05 = midpoint of AT and T1
+
+        3) Gate TOUCH
+        -> Entry SELL_T1
+        -> Target T15
+        """
+        if day_df.empty:
+            return None
+
+        day_df = day_df.sort_values("time").reset_index(drop=True)
+
+        max_idx = day_df["high"].idxmax()
+        high_row = day_df.loc[max_idx]
+
+        day_high = float(high_row["high"])
+        high_low = float(high_row["low"])
+        picked_time = high_row["time"]
+
+        high_atr = float(high_row.get("atr", 0.0))
+        if not np.isfinite(high_atr) or high_atr <= 0:
+            found_atr = None
+            for k in range(max_idx - 1, -1, -1):
+                atr_val = float(day_df.iloc[k].get("atr", 0.0))
+                if np.isfinite(atr_val) and atr_val > 0:
+                    found_atr = atr_val
+                    break
+            if found_atr is not None:
+                high_atr = found_atr
+                print(
+                    f"  -> HIGH pattern: ATR at day high invalid, using previous valid ATR={high_atr:.5f}"
+                )
             else:
-                buffer_val = atr / 7.0
-        else:
-            # Normal day
-            if atr < 0.00150:
-                buffer_val = atr / 7.0
-            else:
-                buffer_val = atr / 10.0
+                print("  -> HIGH pattern: no valid ATR found before day high, skip")
+                return None
 
-        if side == "B":
-            trigger_level = entry_price + buffer_val
-            if high >= trigger_level:
-                return round(trigger_level, 5)
-        else:  # "S"
-            trigger_level = entry_price - buffer_val
-            if low <= trigger_level:
-                return round(trigger_level, 5)
+        breakout_idx = None
+        breakout_time = None
+        breakout_close = None
 
-        return None
+        for j in range(max_idx + 1, len(day_df)):
+            r = day_df.iloc[j]
+            c = float(r["close"])
+            l = float(r["low"])
+            prev_low = float(day_df.iloc[j - 1]["low"]) if j > 0 else l
 
-    # ------------------ ENTRY WINDOW (PENDING) ------------------
+            if c < high_low and l < high_low and l < prev_low:
+                breakout_idx = j
+                breakout_time = r["time"]
+                breakout_close = c
+                break
+
+        if breakout_idx is None:
+            print(
+                "  -> HIGH pattern: no valid LL close-break < high_low after day high, skip")
+            return None
+
+        sustain_end_time = breakout_time + timedelta(minutes=15 * 6)
+        sustain_mask = (day_df["time"] > breakout_time) & (
+            day_df["time"] <= sustain_end_time)
+        sustain_df = day_df.loc[sustain_mask]
+
+        if not sustain_df.empty:
+            max_high_in_window = float(sustain_df["high"].max())
+            if max_high_in_window > day_high:
+                print(
+                    f"  -> HIGH pattern: new higher high {max_high_in_window:.5f} "
+                    f"during sustain (base={day_high:.5f}), skip"
+                )
+                return None
+
+        gann_input = high_low
+        gann_levels = self._get_gann_from_lookup(gann_input)
+        if not gann_levels:
+            print("  -> Gann lookup failed for HIGH pattern")
+            return None
+
+        levels = StrategyCalculator._extract_levels(gann_levels)
+
+        sell_at = float(levels["sell_at"])
+        sell_t1 = float(levels["sell_t1"])
+        sell_t15 = float(levels["sell_t15"])
+
+        gate_level = high_low - high_atr
+        r39_level = high_low - high_atr * 3.9
+
+        gate_touched = gate_level < sell_at
+        r39_touched = r39_level < sell_at
+
+        print(
+            f"  -> HIGH DEBUG: high_low={high_low:.5f}, AT={sell_at:.5f}, "
+            f"gate_level={gate_level:.5f}, gate_touched={gate_touched}, "
+            f"r39_level={r39_level:.5f}, r39_touched={r39_touched}"
+        )
+
+        selection = self._select_entry_target_from_gate_and_39(
+            side="SELL",
+            gate_touched=gate_touched,
+            r39_touched=r39_touched,
+            at=sell_at,
+            t1=sell_t1,
+            t15=sell_t15,
+        )
+
+        sl_price = sell_at if selection["entry_mode"] == "SELL_T1" else float(
+            levels["buy_at"])
+
+        setup = StrategyCalculator.build_custom_setup(
+            side="S",
+            entry=float(selection["entry_price"]),
+            sl=sl_price,
+            tp=float(selection["tp_price"]),
+            fund=fund,
+            risk_percent=risk_percent,
+            pair=self.pair,
+            entry_mode=selection["entry_mode"],
+            target_mode=selection["target_mode"],
+        )
+
+        setup["trigger_time"] = breakout_time
+        setup["picked_candle_time"] = picked_time
+        setup["breakout_candle_time"] = breakout_time
+        setup["breakout_close"] = breakout_close
+        setup["compare_level"] = high_low
+        setup["gate_level"] = round(gate_level, 5)
+        setup["r39_level"] = round(r39_level, 5)
+        setup["gate_touched"] = bool(gate_touched)
+        setup["r39_touched"] = bool(r39_touched)
+        setup["atr"] = round(high_atr, 5)
+
+        print(
+            f"  -> HIGH pattern: picked_time={picked_time}, "
+            f"high={day_high:.5f}, low={high_low:.5f}, "
+            f"breakout_time={breakout_time}, breakout_close={breakout_close:.5f}, "
+            f"ATR={high_atr:.5f}, gate_level={gate_level:.5f}, gate_touched={gate_touched}, "
+            f"r39_level={r39_level:.5f}, r39_touched={r39_touched}, "
+            f"mode={setup['entry_mode']}, target_mode={setup['target_mode']}, "
+            f"entry={setup['entry']:.5f}, SL={setup['sl']:.5f}, TP={setup['tp']:.5f}"
+        )
+
+        return setup
 
     def _wait_for_entry_in_window(
         self,
         day_df: pd.DataFrame,
         setup: Dict,
-        bo_time: datetime,
-        is_new_orb_shifted: bool = False,
+        window_start_server: datetime,
+        window_end_server: datetime,
+        session_atr: float,
     ) -> Optional[Dict]:
         """
-        7:31–19:30 or 7:31–20:30 IST entry window depending on market type.
-        Entry sirf ORB breakout ke baad hi allow.
-        If price never touches entry in this window → order_expired (no trade).
+        Generic entry window on SERVER time.
+
+        STRICT ATR BUFFER MODE:
+        - Session ORB ka ATR use hoga
+        - Buffer formula _check_atr_buffer_entry ke hisaab se apply hoga
+        - Buffer hit nahi hua to entry nahi hogi
+        - Direct touch fallback DISABLED
         """
-        entry_price = setup["entry"]
+        entry_price = float(setup["entry"])
         side = setup["side"]
 
-        day_date = bo_time.date()
-
-        # 1. market type infer karo (3:30_window vs 2:30_window)
-        market_type = self._infer_market_type(day_df)
-
-        # 2. day ke hisaab se expiry time (IST)
-        expire_ist = self._get_entry_expire_time(day_date, market_type)
-
-        # 3. IST side pe min start = 7:31, but not before breakout candle
-        after_bo = day_df[day_df["time"] > bo_time]
-        if after_bo.empty:
-            return None
-        first_after_bo_time = after_bo["time"].iloc[0]
-
-        entry_start_ist_dt = datetime.combine(day_date, self.entry_start_ist)
-        entry_start_server_by_time = DSTHelper.ist_to_server(
-            entry_start_ist_dt)
-        entry_start_server = max(
-            entry_start_server_by_time, first_after_bo_time)
-
-        expire_ist_dt = datetime.combine(day_date, expire_ist)
-        expire_server = DSTHelper.ist_to_server(expire_ist_dt)
-
         print(
-            f"  -> Entry window (server): {entry_start_server} to {expire_server} | "
-            f"Market: {market_type}"
+            f"  -> Entry window (server): {window_start_server} to {window_end_server}"
         )
+        print(f"  -> Session ATR for buffer: {session_atr:.5f}")
 
-        mask = (day_df["time"] >= entry_start_server) & (
-            day_df["time"] < expire_server)
+        mask = (day_df["time"] >= window_start_server) & (
+            day_df["time"] < window_end_server
+        )
         search_df = day_df.loc[mask]
 
         if search_df.empty:
             print("  -> No candles in entry window (pending expires)")
             return None
 
+        if session_atr is None or session_atr <= 0:
+            print("  -> Invalid session ATR, buffer entry disabled for this session")
+            return None
+
         for idx in search_df.index:
             row = day_df.loc[idx]
             row_time = row["time"]
-            high = row["high"]
-            low = row["low"]
-            atr = row.get("atr", 0.0)
+            high = float(row["high"])
+            low = float(row["low"])
 
             actual_entry = self._check_atr_buffer_entry(
                 entry_price=entry_price,
                 side=side,
-                atr=atr,
+                atr=session_atr,
                 high=high,
                 low=low,
-                is_new_orb_shifted=is_new_orb_shifted,
+                is_new_orb_shifted=False,
             )
 
             if actual_entry is not None:
+                print(
+                    f"  -> {side} ATR-buffer entry hit at {row_time}, actual_entry={actual_entry:.5f}"
+                )
                 return {
                     "entry_idx": idx,
                     "entry_time": row_time,
                     "actual_entry": actual_entry,
                 }
 
+        print(f"  -> {side} pending not filled with ATR buffer in this session")
         return None
 
-    def _wait_for_first_fill_in_window(
+    def _wait_for_first_fill_in_window_session(
         self,
         day_df: pd.DataFrame,
         buy_setup: Dict,
         sell_setup: Dict,
-        bo_time: datetime,
-        is_new_orb_shifted: bool = False,
+        window_start_server: datetime,
+        window_end_server: datetime,
+        session_atr: float,
     ) -> Optional[Dict]:
         """
-        Breakout ke baad buy/sell dono entries ko race mode me watch karo.
-        Jo side pehle fill ho wahi actual trade.
-        Agar dono same H1 candle me fill ho jayein, M1 se first touch decide karne ki koshish karo.
+        BUY/SELL dono ko same session window me race mode me dekho.
+        Jo side pehle fill ho wahi final trade.
+
+        Dono sides ke liye same session ORB ATR-based buffer use hoga.
         """
         buy_result = self._wait_for_entry_in_window(
-            day_df, buy_setup, bo_time, is_new_orb_shifted
-        )
-        sell_result = self._wait_for_entry_in_window(
-            day_df, sell_setup, bo_time, is_new_orb_shifted
+            day_df=day_df,
+            setup=buy_setup,
+            window_start_server=window_start_server,
+            window_end_server=window_end_server,
+            session_atr=session_atr,
         )
 
+        sell_result = self._wait_for_entry_in_window(
+            day_df=day_df,
+            setup=sell_setup,
+            window_start_server=window_start_server,
+            window_end_server=window_end_server,
+            session_atr=session_atr,
+        )
+
+        # Dono side expire ho gaye
         if not buy_result and not sell_result:
             return None
 
+        # Sirf BUY fill
         if buy_result and not sell_result:
             return {"setup": buy_setup, "entry_result": buy_result}
 
+        # Sirf SELL fill
         if sell_result and not buy_result:
             return {"setup": sell_setup, "entry_result": sell_result}
 
+        # Dono fill hue -> jo pehle time pe aaya
         buy_time = buy_result["entry_time"]
         sell_time = sell_result["entry_time"]
 
@@ -833,52 +803,23 @@ class BacktestEngine1HORB:
         if sell_time < buy_time:
             return {"setup": sell_setup, "entry_result": sell_result}
 
-        # Same H1 candle fill on both sides -> try M1 tie-break
-        from_time = buy_time
-        to_time = buy_time + timedelta(hours=1)
+        # Same candle pe dono fill -> open ke close side ko choose karo
+        same_row = day_df[day_df["time"] == buy_time]
+        if same_row.empty:
+            return {"setup": buy_setup, "entry_result": buy_result}
 
-        try:
-            from live_data_mt5 import fetch_live_1m
-            m1_df = fetch_live_1m(self.pair, from_time, to_time)
+        row = same_row.iloc[0]
+        open_price = float(row["open"])
 
-            if not m1_df.empty:
-                m1_df["time"] = pd.to_datetime(m1_df["time"])
-                mask = (m1_df["time"] >= from_time) & (
-                    m1_df["time"] <= to_time)
-                m1_df = m1_df.loc[mask].sort_values(
-                    "time").reset_index(drop=True)
+        buy_dist = abs(float(buy_setup["entry"]) - open_price)
+        sell_dist = abs(open_price - float(sell_setup["entry"]))
 
-                for _, row in m1_df.iterrows():
-                    buy_hit = row["high"] >= buy_setup["entry"]
-                    sell_hit = row["low"] <= sell_setup["entry"]
+        if buy_dist <= sell_dist:
+            return {"setup": buy_setup, "entry_result": buy_result}
+        else:
+            return {"setup": sell_setup, "entry_result": sell_result}
 
-                    if buy_hit and not sell_hit:
-                        return {"setup": buy_setup, "entry_result": buy_result}
-
-                    if sell_hit and not buy_hit:
-                        return {"setup": sell_setup, "entry_result": sell_result}
-
-                    if buy_hit and sell_hit:
-                        # same M1 candle ambiguity -> conservative fallback
-                        # current fallback: choose side with smaller distance from candle open
-                        open_price = row["open"]
-                        buy_dist = abs(buy_setup["entry"] - open_price)
-                        sell_dist = abs(open_price - sell_setup["entry"])
-
-                        if buy_dist <= sell_dist:
-                            return {"setup": buy_setup, "entry_result": buy_result}
-                        else:
-                            return {"setup": sell_setup, "entry_result": sell_result}
-
-        except Exception as e:
-            print(
-                YELLOW
-                + f"  -> Same-candle dual-fill M1 tie-break failed ({e}), defaulting to earlier listed side"
-                + RESET
-            )
-
-        # fallback if same timestamp and M1 unavailable
-        return {"setup": buy_setup, "entry_result": buy_result}
+    # ------------------ ENTRY WINDOW (PENDING) ------------------
 
     def _resolve_same_candle_exit_with_m1(
         self,
@@ -887,14 +828,21 @@ class BacktestEngine1HORB:
         actual_entry: float,
         sl: float,
         tp: float,
-    ) -> Optional[str]:
+    ) -> Optional[Dict]:
         """
-        Same H1 candle me entry + SL/TP ambiguity ko M1 sequence se resolve karo.
+        Same bar me entry + SL/TP ambiguity ko M1 sequence se resolve karo.
+
         Return:
-            "tp", "sl", or None
-        Rule:
-        - Entry ke baad hi SL/TP valid hoga
-        - Entry se pehle ka touch ignore hoga
+            None -> M1 me entry confirm hi nahi hui
+            {
+                "result": "tp" | "sl" | "session_exit",
+                "exit_time": <pd.Timestamp>,
+                "exit_price": <float>,
+            }
+
+        Rules:
+        - Entry ke baad hi SL/TP valid hoga.
+        - Entry se pehle ka touch ignore hoga.
         """
         from_time = entry_time
         to_time = entry_time + timedelta(hours=1)
@@ -905,28 +853,31 @@ class BacktestEngine1HORB:
         except Exception as e:
             print(
                 YELLOW
-                + f"  -> M1 fetch failed ({e}), keeping H1 result as-is"
+                + f"  -> M1 fetch failed ({e}), keeping bar-level result as-is"
                 + RESET
             )
             return None
 
         if m1_df is None or m1_df.empty:
-            print(YELLOW + "  -> M1 empty, keeping H1 result as-is" + RESET)
+            print(YELLOW + "  -> M1 empty, keeping bar-level result as-is" + RESET)
             return None
 
         m1_df["time"] = pd.to_datetime(m1_df["time"])
-        m1_df = m1_df[(m1_df["time"] >= from_time) &
-                      (m1_df["time"] <= to_time)].copy()
+        m1_df = m1_df[
+            (m1_df["time"] >= from_time) & (m1_df["time"] <= to_time)
+        ].copy()
         m1_df = m1_df.sort_values("time").reset_index(drop=True)
 
         entry_found = False
+        entry_bar_time = None
 
         for _, row in m1_df.iterrows():
-            o = row["open"]
-            h = row["high"]
-            l = row["low"]
+            o = float(row["open"])
+            h = float(row["high"])
+            l = float(row["low"])
             t = row["time"]
 
+            # ----- 1) ENTRY CHECK -----
             if side == "B":
                 entry_hit = h >= actual_entry
             else:
@@ -937,9 +888,10 @@ class BacktestEngine1HORB:
                     continue
 
                 entry_found = True
+                entry_bar_time = t
                 print(CYAN + f"  -> M1 entry confirmed at/after {t}" + RESET)
 
-                # Same M1 candle me entry ke baad immediate ambiguity
+                # Same M1 candle me immediate TP/SL check
                 if side == "B":
                     tp_hit = h >= tp
                     sl_hit = l <= sl
@@ -953,16 +905,29 @@ class BacktestEngine1HORB:
                         + "  -> Same M1 candle me entry + TP/SL ambiguity, conservative SL applied"
                         + RESET
                     )
-                    return "sl"
+                    return {
+                        "result": "sl",
+                        "exit_time": t,
+                        "exit_price": sl,
+                    }
 
                 if tp_hit:
-                    return "tp"
+                    return {
+                        "result": "tp",
+                        "exit_time": t,
+                        "exit_price": tp,
+                    }
                 if sl_hit:
-                    return "sl"
+                    return {
+                        "result": "sl",
+                        "exit_time": t,
+                        "exit_price": sl,
+                    }
 
+                # entry candle processed, next loop me post-entry candles handle honge
                 continue
 
-            # Entry milne ke baad next M1 candles me exit check
+            # ----- 2) POST-ENTRY CANDLES -----
             if side == "B":
                 tp_hit = h >= tp
                 sl_hit = l <= sl
@@ -976,19 +941,136 @@ class BacktestEngine1HORB:
                     + f"  -> Post-entry same M1 ambiguity at {t}, conservative SL applied"
                     + RESET
                 )
-                return "sl"
+                return {
+                    "result": "sl",
+                    "exit_time": t,
+                    "exit_price": sl,
+                }
 
             if tp_hit:
-                return "tp"
+                return {
+                    "result": "tp",
+                    "exit_time": t,
+                    "exit_price": tp,
+                }
 
             if sl_hit:
-                return "sl"
+                return {
+                    "result": "sl",
+                    "exit_time": t,
+                    "exit_price": sl,
+                }
 
-        return None
+        # Entry candle hi nahi mila → bar-level pe depend karo
+        if not entry_found:
+            print(
+                YELLOW
+                + "  -> M1 could not confirm entry, keeping bar-level result as-is"
+                + RESET
+            )
+            return None
+
+        # Entry mil gayi, lekin 1h window me na TP na SL → treat as session_exit in M1 window
+        last_row = m1_df.iloc[-1]
+        return {
+            "result": "session_exit",
+            "exit_time": last_row["time"],
+            "exit_price": float(last_row["close"]),
+        }
 
         # ------------------ TRADE SIMULATION (MULTI-DAY) ------------------
 
+    def _fetch_m1_data_for_window(self, start_time, end_time):
+        try:
+            df_m1 = fetch_live_1m(
+                self.pair,
+                start=start_time - timedelta(minutes=1),
+                end=end_time + timedelta(minutes=1),
+            )
+        except Exception as e:
+            print(
+                YELLOW
+                + f"  -> Failed to fetch M1 data for MAE window: {e}"
+                + RESET
+            )
+            return pd.DataFrame()
+
+        if df_m1 is None or df_m1.empty:
+            return pd.DataFrame()
+
+        df_m1 = df_m1.copy()
+        df_m1["time"] = pd.to_datetime(df_m1["time"])
+        df_m1 = df_m1.sort_values("time").reset_index(drop=True)
+
+        return df_m1[
+            (df_m1["time"] >= start_time)
+            & (df_m1["time"] <= end_time)
+        ].copy()
+
     # ------------------ TRADE SIMULATION (MULTI-DAY) ------------------
+
+    def _compute_m1_mae_after_entry(
+        self,
+        side: str,
+        entry_time,
+        exit_time,
+        actual_entry: float,
+        lot_size: float,
+    ):
+        try:
+            m1_df = self._fetch_m1_data_for_window(entry_time, exit_time)
+        except Exception as e:
+            print(
+                YELLOW
+                + f"  -> M1 MAE fetch failed: {e}"
+                + RESET
+            )
+            return 0.0, 0.0
+
+        if m1_df is None or m1_df.empty:
+            print(
+                YELLOW
+                + "  -> No M1 data in window for MAE, returning 0"
+                + RESET
+            )
+            return 0.0, 0.0
+        print(
+            CYAN
+            + f"  -> M1 MAE window {self.pair} {entry_time} -> {exit_time}, rows={len(m1_df)}"
+            + RESET
+        )
+
+        pip_value = StrategyCalculator.get_pip_value_per_lot(
+            self.pair, actual_entry
+        )
+        pip_multiplier = 100.0 if self.pair.endswith("JPY") else 10000.0
+
+        max_adverse_pips = 0.0
+        max_adverse_amount = 0.0
+
+        for _, row in m1_df.iterrows():
+            candle_time = row["time"]
+
+            # Entry se pehle ka sab ignore
+            if candle_time < entry_time:
+                continue
+
+            if side == "B":
+                adverse_pips = max(
+                    0.0, (actual_entry - float(row["low"])) * pip_multiplier
+                )
+            else:
+                adverse_pips = max(
+                    0.0, (float(row["high"]) - actual_entry) * pip_multiplier
+                )
+
+            adverse_amount = adverse_pips * pip_value * lot_size
+
+            if adverse_amount > max_adverse_amount:
+                max_adverse_amount = adverse_amount
+                max_adverse_pips = adverse_pips
+
+        return round(max_adverse_pips, 1), round(max_adverse_amount, 2)
 
     def _simulate_trade(
         self,
@@ -1000,25 +1082,43 @@ class BacktestEngine1HORB:
         """
         Simulate trade from entry until SL/TP or data end (multi-day).
         No time-based force exit; only TP/SL or data end.
-        Special: agar entry aur SL/TP same H1 candle me aayein,
-        to pehle 1-min data se confirm karega.
+
+        IMPORTANT MAE RULE:
+        - H1 candle ka pre-entry low/high MAE me count nahi hoga.
+        - Final MAE will be computed from M1 candles AFTER actual entry.
+
+        10H SL_BE RULE (HYBRID):
+        - Entry ke 10 hours baad agar trade abhi open hai:
+        * TP ko entry->TP distance ke 80% par reduce karo
+        * SL ko entry se 10% distance aage profit me shift karo
+            (BUY: entry + 0.1*dist, SELL: entry - 0.1*dist)
         """
+
         side = setup["side"]
         sl = setup["sl"]
         tp = setup["tp"]
         lot_size = setup["lot_size"]
+        entry_mode = setup.get("entry_mode", "")
 
-        # entry_idx is label index -> use .loc on FULL df
         entry_row = df.loc[entry_idx]
         entry_time = entry_row["time"]
         entry_day = entry_time.date()
 
-        if side == "B":
-            risk = actual_entry - sl
-        else:
-            risk = sl - actual_entry
+        try:
+            pair_str = getattr(self, "pair", "UNKNOWN")
+        except Exception:
+            pair_str = "UNKNOWN"
+
+        print(
+            CYAN
+            + f"     -> {pair_str} {side} TRADE | "
+            f"Entry={entry_time} @ {actual_entry:.5f} | "
+            f"LotSize={lot_size:.2f}"
+            + RESET
+        )
 
         tp_adjusted = False
+        be_applied = False
 
         pos = df.index.get_loc(entry_idx)
         idx = pos
@@ -1027,13 +1127,48 @@ class BacktestEngine1HORB:
         exit_time = entry_time
         result = "session_exit"
 
+        pip_value = StrategyCalculator.get_pip_value_per_lot(
+            self.pair, actual_entry)
+        pip_multiplier = 100.0 if self.pair.endswith("JPY") else 10000.0
+
+        max_adverse_pips = 0.0
+        max_adverse_amount = 0.0
+
         while idx < len(df):
             row = df.iloc[idx]
             row_time = row["time"]
             high = row["high"]
             low = row["low"]
 
-            # ---- Day change detection & TP adjustment (2R -> 1.5R approx) ----
+            # ---------- 1) TIME-BASED 10H SL_BE (10% lock) + 80% TP ----------
+            if ((row_time - entry_time) >= timedelta(hours=10)) and (not be_applied):
+                if side == "B":
+                    orig_tp_dist = tp - actual_entry
+                else:
+                    orig_tp_dist = actual_entry - tp
+
+                if orig_tp_dist > 0:
+                    lock_dist = orig_tp_dist * 0.10       # 10% profit lock
+                    new_tp_dist = orig_tp_dist * 0.80     # 80% target
+
+                    if side == "B":
+                        new_sl = actual_entry + lock_dist
+                        new_tp = actual_entry + new_tp_dist
+                    else:
+                        new_sl = actual_entry - lock_dist
+                        new_tp = actual_entry - new_tp_dist
+
+                    print(
+                        CYAN
+                        + f"  -> 10h passed, SL_BE+TP80 applied at {row_time}: "
+                        f"SL {sl:.5f} -> {new_sl:.5f}, TP {tp:.5f} -> {new_tp:.5f}"
+                        + RESET
+                    )
+                    sl = new_sl
+                    tp = new_tp
+                    be_applied = True
+
+            # ---------- 2) DAY CHANGE TP REDUCTION (~2R -> ~1.5R) ----------
             if (row_time.date() != entry_day) and (not tp_adjusted):
                 if side == "B":
                     orig_tp_dist = tp - actual_entry
@@ -1054,10 +1189,10 @@ class BacktestEngine1HORB:
                         + RESET
                     )
 
-            # ---- Normal TP/SL logic + SAME-CANDLE FLAG ----
             hit_same_candle = False
-            hit_type = None  # "tp" or "sl"
+            hit_type = None
 
+            # ---------- 3) TP / SL HIT CHECKS ----------
             if side == "B":
                 if high >= tp:
                     exit_price = tp
@@ -1071,7 +1206,7 @@ class BacktestEngine1HORB:
                 if low <= sl:
                     exit_price = sl
                     exit_time = row_time
-                    result = "sl"
+                    result = "sl_lock10" if be_applied else "sl"
                     if row_time == entry_time:
                         hit_same_candle = True
                         hit_type = "sl"
@@ -1090,18 +1225,18 @@ class BacktestEngine1HORB:
                 if high >= sl:
                     exit_price = sl
                     exit_time = row_time
-                    result = "sl"
+                    result = "sl_lock10" if be_applied else "sl"
                     if row_time == entry_time:
                         hit_same_candle = True
                         hit_type = "sl"
                     else:
                         break
 
-            # Agar same H1 candle me hit hua hai, to M1 sequence se resolve karo
+            # ---------- 4) SAME-CANDLE M1 RESOLUTION ----------
             if hit_same_candle and hit_type is not None:
                 print(
                     CYAN
-                    + f"  -> Same H1 candle {hit_type.upper()} at {row_time}, checking M1 sequence..."
+                    + f"  -> Same bar {hit_type.upper()} at {row_time}, checking M1 sequence..."
                     + RESET
                 )
 
@@ -1116,47 +1251,53 @@ class BacktestEngine1HORB:
                 if resolved is None:
                     print(
                         YELLOW
-                        + "  -> M1 could not resolve sequence, keeping H1 result as-is"
+                        + "  -> M1 could not confirm entry, keeping bar-level result as-is"
                         + RESET
                     )
                     break
 
-                if resolved != hit_type:
+                m1_result = resolved.get("result")
+                m1_exit_time = resolved.get("exit_time")
+                m1_exit_price = resolved.get("exit_price")
+
+                if m1_result not in ("tp", "sl", "session_exit") or m1_exit_time is None:
                     print(
                         YELLOW
-                        + f"  -> M1 sequence override: H1 said {hit_type.upper()}, actual is {resolved.upper()}"
+                        + "  -> M1 returned invalid result, keeping bar-level result as-is"
+                        + RESET
+                    )
+                    break
+
+                if m1_result != hit_type and m1_result in ("tp", "sl"):
+                    print(
+                        YELLOW
+                        + f"  -> M1 sequence override: bar said {hit_type.upper()}, "
+                        f"actual is {m1_result.upper()} at {m1_exit_time}"
                         + RESET
                     )
 
-                if resolved == "tp":
-                    exit_price = tp
-                    exit_time = row_time
+                if m1_result == "tp":
+                    exit_price = m1_exit_price if m1_exit_price is not None else tp
                     result = "tp"
+                elif m1_result == "sl":
+                    exit_price = m1_exit_price if m1_exit_price is not None else sl
+                    result = "sl_lock10" if be_applied else "sl"
                 else:
-                    exit_price = sl
-                    exit_time = row_time
-                    result = "sl"
+                    exit_price = m1_exit_price
+                    result = "session_exit"
 
+                exit_time = m1_exit_time
                 break
 
             idx += 1
 
-        # Agar TP/SL nahi laga aur poore data ka end aa gaya:
+        # ---------- 5) SESSION EXIT (DATA END) ----------
         if result == "session_exit":
             last_row = df.iloc[-1]
             exit_price = last_row["close"]
             exit_time = last_row["time"]
 
-        # PNL
-        pip_value = StrategyCalculator.get_pip_value_per_lot(
-            self.pair, actual_entry
-        )
-
-        if self.pair.endswith("JPY"):
-            pip_multiplier = 100.0
-        else:
-            pip_multiplier = 10000.0
-
+        # ---------- 6) PNL ----------
         if side == "B":
             pnl_pips = (exit_price - actual_entry) * pip_multiplier
         else:
@@ -1164,12 +1305,13 @@ class BacktestEngine1HORB:
 
         pnl_amount = pnl_pips * pip_value * lot_size
 
+        balance_before_trade = self.current_fund
+
         self.current_fund += pnl_amount
         self.equity_high = max(self.equity_high, self.current_fund)
         drawdown = self.equity_high - self.current_fund
         self.max_drawdown = max(self.max_drawdown, drawdown)
 
-        # STOP condition: agar fund 0 ya neeche chala gaya
         if self.current_fund <= 0:
             print(
                 YELLOW
@@ -1177,6 +1319,20 @@ class BacktestEngine1HORB:
                 + RESET
             )
             self.stop_requested = True
+
+        # ---------- 7) FINAL TRUE MAE FROM M1 ----------
+        m1_mae_pips, m1_mae_amount = self._compute_m1_mae_after_entry(
+            side=side,
+            entry_time=entry_time,
+            exit_time=exit_time,
+            actual_entry=actual_entry,
+            lot_size=lot_size,
+        )
+
+        max_adverse_pips = m1_mae_pips
+        max_adverse_amount = m1_mae_amount
+
+        min_available_balance_during_trade = balance_before_trade - max_adverse_amount
 
         trade_record = {
             "date": entry_time.date(),
@@ -1192,182 +1348,40 @@ class BacktestEngine1HORB:
             "pnl_pips": round(pnl_pips, 1),
             "pnl_amount": round(pnl_amount, 2),
             "fund_after": round(self.current_fund, 2),
+            "max_adverse_pips": round(max_adverse_pips, 1),
+            "max_adverse_amount": round(max_adverse_amount, 2),
+            "balance_before_trade": round(balance_before_trade, 2),
+            "min_available_balance_during_trade": round(min_available_balance_during_trade, 2),
+            "entry_mode": entry_mode,
+            "sl_mode": "LOCK10_TP80" if be_applied else "NORMAL",
+            "lot_size": round(lot_size, 2),
         }
-
         self.trades.append(trade_record)
         self.total_trades += 1
 
         return trade_record
 
-    def run_single_pair(self, csv_path: str) -> None:
-        df = pd.read_csv(csv_path)
-        df["time"] = pd.to_datetime(df["datetime"])  # server time
-        df = df.sort_values("time").reset_index(drop=True)
-
-        # ATR on full data
-        df = self._add_atr_column(df)
-
-        print(f"Loaded {len(df)} 1H candles from {csv_path}")
-
-        grouped = df.groupby(df["time"].dt.date)
-
-        for day, day_df in grouped:
-            print("\n" + "=" * 60)
-            print(f"[{self.pair}] Processing: {day}")
-            print(f"Current Fund: ${self.current_fund:.2f}")
-
-            # Basic day validation (00:00 + ATR)
-            if not self._validate_day(day_df):
-                print("  -> Day invalid, skipping")
-                continue
-
-            # ORB decision (3 rules)
-            orb_info = self._decide_orb(day_df)
-            orb = orb_info["orb"]
-            rule_used = orb_info["rule"]
-            breakout = orb_info["breakout"]  # ho sakta hai None
-            is_new_orb_shifted = orb_info.get("is_new_orb_shifted", False)
-
-            if not orb:
-                print("  -> No ORB available for this day, skipping")
-                continue
-
-            if rule_used == 0:
-                print(CYAN + "  -> ORB 00:00 retained (no rule triggered)" + RESET)
-
-            # Agar ORB helper me breakout nahi mila, yahan se dhundo
-            if breakout is None:
-                breakout = self._detect_breakout(day_df, orb)
-                if not breakout:
-                    print("  -> No breakout after selected ORB candle")
-                    continue
-
-            print(f"  -> Gann INPUT price: {breakout['input_price']:.5f}")
-
-            # 🔹 Gann levels from LOCAL JSON LOOKUP
-            gann_levels = self._get_gann_from_lookup(breakout["input_price"])
-            if not gann_levels:
-                print("  -> Local Gann lookup failed, skipping day")
-                continue
-
-            fund = self.current_fund
-
-            # Weekly risk ramp based on day
-            if self.start_date is not None:
-                week_num = ((day - self.start_date).days // 7) + 1
-            else:
-                week_num = 1
-
-            risk_percent = self.base_risk_percent + (week_num - 1)
-            print(f"  -> Week {week_num}: Risk={risk_percent:.1f}%")
-
-            # Breakout sirf Gann trigger ke liye hai, side force nahi karega
-            buy_setup = StrategyCalculator.get_buy_bo_primary(
-                gann_levels, fund, risk_percent, pair=self.pair
-            )
-            sell_setup = StrategyCalculator.get_sell_bo_primary(
-                gann_levels, fund, risk_percent, pair=self.pair
-            )
-
-            buy_setup["side"] = "B"
-            sell_setup["side"] = "S"
-
-            primary = buy_setup
-            opposite = sell_setup
-
-            print(
-                f"  -> BUY  Entry={buy_setup['entry']:.5f}, "
-                f"SL={buy_setup['sl']:.5f}, TP={buy_setup['tp']:.5f}, Lot={buy_setup['lot_size']:.2f}"
-            )
-            print(
-                f"  -> SELL Entry={sell_setup['entry']:.5f}, "
-                f"SL={sell_setup['sl']:.5f}, TP={sell_setup['tp']:.5f}, Lot={sell_setup['lot_size']:.2f}"
-            )
-
-            # Do for both legs, but agar ek side fill ho jaye to dusri skip
-            any_filled = False
-
-            for setup in (buy_setup, sell_setup):
-                # Agar pehle hi koi trade fill ho chuka hai, dusri side skip
-                if any_filled:
-                    print(
-                        f"  -> {setup['side']} leg skipped because opposite side already filled")
-                    continue
-
-                entry_result = self._wait_for_entry_in_window(
-                    day_df, setup, breakout["bo_time"], is_new_orb_shifted
-                )
-
-                if not entry_result:
-                    print(
-                        f"  -> {setup['side']} pending not filled till 19:30 IST "
-                        f"(order_expired_1930)"
-                    )
-                    self.trades.append(
-                        {
-                            "date": day,
-                            "pair": self.pair,
-                            "side": setup["side"],
-                            "entry_time": None,
-                            "entry_price": setup["entry"],
-                            "sl": setup["sl"],
-                            "tp": setup["tp"],
-                            "exit_time": None,
-                            "exit_price": None,
-                            "result": "order_expired_1930",
-                            "pnl_pips": 0.0,
-                            "pnl_amount": 0.0,
-                            "fund_after": round(self.current_fund, 2),
-                        }
-                    )
-                    self.total_trades += 1
-                    continue
-
-                # Yahan aate hi is side ka order fill ho gaya
-                any_filled = True
-
-                print(
-                    f"  -> {setup['side']} Entry filled at {entry_result['entry_time']}, "
-                    f"price={entry_result['actual_entry']:.5f}"
-                )
-
-                trade = self._simulate_trade(
-                    df,  # FULL DATA
-                    setup,
-                    entry_result["entry_idx"],
-                    entry_result["actual_entry"],
-                )
-
-                print(
-                    f"  -> {setup['side']} Exit {trade['result']} at {trade['exit_time']}, "
-                    f"price={trade['exit_price']:.5f}, "
-                    f"PNL=${trade['pnl_amount']:.2f}, Fund=${trade['fund_after']:.2f}"
-                )
-
-        # Win rate
-        wins = sum(1 for t in self.trades if t["result"] == "tp")
-        if self.total_trades > 0:
-            self.win_rate = wins / self.total_trades * 100.0
-
-        # ------------------ EXCEL EXPORT ------------------
-
     def run_backtest(self, specs) -> None:
         """
         specs: list of dicts:
         [
-          {"pair": "EURAUD.raw", "csv": "EURAUD_H1.csv"},
-          {"pair": "GBPAUD.raw", "csv": "GBPAUD_H1.csv"},
-          ...
+            {"pair": "EURAUD.ecn", "csv": "EURAUD_H1.csv"},
+            {"pair": "GBPAUD.ecn", "csv": "GBPAUD_H1.csv"},
+            ...
         ]
         Shared fund across all pairs.
 
-        NAYA FLOW:
+        NEW FLOW:
         - Global min_date..max_date nikalo (START_DATE/END_DATE ke andar)
-        - Har day ke liye sab pairs loop, us din ka slice run_single_day se process
+        - Har day ke liye sab pairs loop
+        - Har pair/day pe NEW Day High/Low pattern process karo
         """
         # 1) Sare CSV load + date range collect
         data_by_pair = {}
         all_dates = set()
+
+        self.daily_briefings = []
+        self.long_duration_trades = []
 
         for spec in specs:
             pair = spec["pair"]
@@ -1377,7 +1391,14 @@ class BacktestEngine1HORB:
             df["time"] = pd.to_datetime(df["datetime"])
             df = df.sort_values("time").reset_index(drop=True)
 
-            # Optional engine-level date filter
+            # 1) ALWAYS compute ATR on full data first (for warm-up)
+            if "atr" not in df.columns:
+                df = self._add_atr_column(df)
+
+            # 2) THEN apply date filter only for backtest range,
+            #    but keep full df in memory for ATR / context
+            full_df = df.copy()
+
             if self.start_date is not None:
                 df = df[df["time"].dt.date >= self.start_date]
             if self.end_date is not None:
@@ -1386,7 +1407,8 @@ class BacktestEngine1HORB:
             if df.empty:
                 continue
 
-            data_by_pair[pair] = df
+            # Store both full_df (for ATR, M1 windows etc.) and filtered df
+            data_by_pair[pair] = full_df
             all_dates.update(df["time"].dt.date.unique())
 
         if not data_by_pair or not all_dates:
@@ -1403,272 +1425,1473 @@ class BacktestEngine1HORB:
             print("\n" + "=" * 60)
             print(f"PROCESSING DAY: {day}")
 
+            day_open_balance = self.current_fund
+            day_profit = 0.0
+            day_trade_count = 0
+            day_tp_hits = 0
+            day_risk_percent = None
+            day_max_lot = 0.0
+
             for pair, df in data_by_pair.items():
-                # Global stop check
                 if getattr(self, "stop_requested", False):
                     break
 
-                # Is pair ke liye is day ka slice
                 day_mask = df["time"].dt.date == day
                 day_df = df.loc[day_mask].copy()
                 if day_df.empty:
                     continue
 
-                # Engine state set
+                # YAHAN: day_df pe ATR ensure + forward fill
+                if "atr" not in day_df.columns:
+                    # Agar full df pe ATR missing hai to pehle wahan add karo
+                    if "atr" not in df.columns:
+                        df = self._add_atr_column(df)
+                        data_by_pair[pair] = df  # update back
+                    # Ab dobara slice lo, ATR ke saath
+                    day_df = df[df["time"].dt.date == day].copy()
+
+                # ATR ko forward-fill karo (agar kisi bar me NaN ho)
+                day_df["atr"] = day_df["atr"].ffill()
+
                 self.pair = pair
                 print("\n" + "-" * 40)
                 print(f"[{pair}] Processing: {day}")
                 print(f"Current Fund: ${self.current_fund:.2f}")
 
-                # ATR ensure (full df pe ek hi baar)
-                if "atr" not in day_df.columns:
-                    full_df = data_by_pair[pair]
-                    if "atr" not in full_df.columns:
-                        full_df = self._add_atr_column(full_df)
-                        data_by_pair[pair] = full_df
-                    day_df = full_df[full_df["time"].dt.date == day]
-
-                # Basic day validation (00:00 + ATR)
                 if not self._validate_day(day_df):
                     print("  -> Day invalid, skipping")
                     continue
 
-                # ORB decision (3 rules)
-                orb_info = self._decide_orb(day_df)
-                orb = orb_info["orb"]
-                rule_used = orb_info["rule"]
-                breakout = orb_info["breakout"]
-                is_new_orb_shifted = orb_info.get("is_new_orb_shifted", False)
-
-                if not orb:
-                    print("  -> No ORB available for this day, skipping")
-                    continue
-
-                if rule_used == 0:
-                    print(CYAN + "  -> ORB 00:00 retained (no rule triggered)" + RESET)
-
-                # Agar ORB helper me breakout nahi mila, yahan se dhundo
-                if breakout is None:
-                    breakout = self._detect_breakout(day_df, orb)
-                    if not breakout:
-                        print("  -> No breakout after selected ORB candle")
-                        continue
-
-                print(f"  -> Gann INPUT price: {breakout['input_price']:.5f}")
-
-                # Gann levels from LOCAL JSON LOOKUP
-                gann_levels = self._get_gann_from_lookup(
-                    breakout["input_price"]
-                )
-                if not gann_levels:
-                    print("  -> Local Gann lookup failed, skipping day")
-                    continue
-
-                fund = self.current_fund
-
-                # Weekly risk ramp based on day
+                # Weekly risk ramp
                 if self.start_date is not None:
                     week_num = ((day - self.start_date).days // 7) + 1
                 else:
                     week_num = 1
 
-                risk_percent = self.base_risk_percent + (week_num - 1)
+                raw_risk_percent = self.base_risk_percent + \
+                    (week_num - 1) * 0.5
+                risk_percent = min(raw_risk_percent, 5.0)
+                day_risk_percent = risk_percent
+
                 print(f"  -> Week {week_num}: Risk={risk_percent:.1f}%")
 
-                # Breakout sirf Gann trigger hai, side force nahi karega
-                if breakout["side"] == "B":
-                    buy_setup = StrategyCalculator.get_buy_bo_primary(
-                        gann_levels, fund, risk_percent, pair=self.pair
-                    )
-                    sell_setup = StrategyCalculator.get_buy_bo_opp_sell(
-                        gann_levels, fund, risk_percent, pair=self.pair
-                    )
-                else:  # breakout["side"] == "S"
-                    sell_setup = StrategyCalculator.get_sell_bo_primary(
-                        gann_levels, fund, risk_percent, pair=self.pair
-                    )
-                    buy_setup = StrategyCalculator.get_sell_bo_opp_buy(
-                        gann_levels, fund, risk_percent, pair=self.pair
-                    )
+                raw_fund = self.current_fund
+                print(f"  -> Sizing Fund: ${raw_fund:,.2f}")
 
-                buy_setup["side"] = "B"
-                sell_setup["side"] = "S"
+                # ===== NEW DAY HIGH/LOW LOGIC =====
+                print("\n" + "-" * 30)
+                print("  -> New Day High/Low pattern processing")
 
-                print(
-                    f"  -> BUY  Entry={buy_setup['entry']:.5f}, "
-                    f"SL={buy_setup['sl']:.5f}, TP={buy_setup['tp']:.5f}, Lot={buy_setup['lot_size']:.2f}"
-                )
-                print(
-                    f"  -> SELL Entry={sell_setup['entry']:.5f}, "
-                    f"SL={sell_setup['sl']:.5f}, TP={sell_setup['tp']:.5f}, Lot={sell_setup['lot_size']:.2f}"
+                high_setup = self._build_high_setup_for_day(
+                    day_df=day_df,
+                    fund=raw_fund,
+                    risk_percent=risk_percent,
                 )
 
-                # Race mode: jo side pehle fill ho wahi trade
-                fill = self._wait_for_first_fill_in_window(
-                    day_df,
-                    buy_setup,
-                    sell_setup,
-                    breakout["bo_time"],
-                    is_new_orb_shifted,
+                low_setup = self._build_low_setup_for_day(
+                    day_df=day_df,
+                    fund=raw_fund,
+                    risk_percent=risk_percent,
                 )
 
-                if not fill:
-                    print(
-                        "  -> Neither BUY nor SELL entry filled till expiry (order_expired_1930)"
-                    )
+                candidates = []
+                if high_setup:
+                    candidates.append(high_setup)
+                if low_setup:
+                    candidates.append(low_setup)
 
-                    for setup in (buy_setup, sell_setup):
-                        self.trades.append(
-                            {
-                                "date": day,
-                                "pair": self.pair,
-                                "side": setup["side"],
-                                "entry_time": None,
-                                "entry_price": setup["entry"],
-                                "sl": setup["sl"],
-                                "tp": setup["tp"],
-                                "exit_time": None,
-                                "exit_price": None,
-                                "result": "order_expired_1930",
-                                "pnl_pips": 0.0,
-                                "pnl_amount": 0.0,
-                                "fund_after": round(self.current_fund, 2),
-                            }
-                        )
-                        self.total_trades += 1
+                if not candidates:
+                    print("  -> No valid Day High/Low setup for this day")
                     continue
 
-                chosen_setup = fill["setup"]
-                entry_result = fill["entry_result"]
-                skipped_side = "S" if chosen_setup["side"] == "B" else "B"
+                # Sab potential setups ko trigger_time ke hisaab se sort karo
+                candidates.sort(key=lambda s: s["trigger_time"])
 
-                print(
-                    f"  -> {chosen_setup['side']} Entry filled FIRST at {entry_result['entry_time']}, "
-                    f"price={entry_result['actual_entry']:.5f}"
-                )
-                print(
-                    f"  -> {skipped_side} leg skipped because opposite side already filled first"
-                )
+                # Ek time pe sirf 1 active trade allowed
+                active_trade_open = False
+                last_exit_time = None
 
-                trade = self._simulate_trade(
-                    df,
-                    chosen_setup,
-                    entry_result["entry_idx"],
-                    entry_result["actual_entry"],
-                )
+                for setup in candidates:
+                    if getattr(self, "stop_requested", False):
+                        break
 
-                print(
-                    f"  -> {chosen_setup['side']} Exit {trade['result']} at {trade['exit_time']}, "
-                    f"price={trade['exit_price']:.5f}, "
-                    f"PNL=${trade['pnl_amount']:.2f}, Fund=${trade['fund_after']:.2f}"
-                )
+                    side = setup["side"]
+                    trigger_time = setup["trigger_time"]
 
-                # Agar fund 0 ya neeche chala gaya, global stop
-                if getattr(self, "stop_requested", False):
+                    # Agar previous trade ka exit_time hai aur ye usse pehle trigger hua hai,
+                    # to isko skip (ye purane window ka pattern hoga)
+                    if last_exit_time is not None and trigger_time <= last_exit_time:
+                        print(
+                            f"  -> HOLD setup side={side} trigger={trigger_time} "
+                            f"because trigger <= last exit {last_exit_time}"
+                        )
+                        continue
+
+                    # Agar koi trade abhi open hai to next setup hold karo
+                    if active_trade_open:
+                        print(
+                            f"  -> HOLD setup side={side} trigger={trigger_time} "
+                            f"because previous trade still open"
+                        )
+                        continue
+
                     print(
-                        YELLOW
-                        + "  -> Global stop triggered (fund <= 0), terminating backtest"
-                        + RESET
+                        f"  -> Chosen setup: side={side}, "
+                        f"picked_candle_time={setup.get('picked_candle_time')}, "
+                        f"trigger_time={trigger_time}, "
+                        f"breakout_time={setup.get('breakout_candle_time')}, "
+                        f"breakout_close={setup.get('breakout_close')}, "
+                        f"compare_level={setup.get('compare_level')}, "
+                        f"entry_mode={setup.get('entry_mode')}, "
+                        f"entry={setup['entry']:.5f}, SL={setup['sl']:.5f}, TP={setup['tp']:.5f}"
                     )
-                    break  # pair loop se bahar
 
-            # outer day loop ke liye stop check
+                    entry_level = float(setup["entry"])
+                    sl = float(setup["sl"])
+                    tp = float(setup["tp"])
+                    lot = float(setup["lot_size"])
+
+                    # ---- ENTRY SEARCH ----
+                    mask = day_df["time"] >= trigger_time
+                    search_df = day_df.loc[mask].copy()
+
+                    if search_df.empty:
+                        print(
+                            f"  -> {side} no candles after trigger_time, skip")
+                        continue
+
+                    entry_idx = None
+                    for idx, row in search_df.iterrows():
+                        h = float(row["high"])
+                        l = float(row["low"])
+                        if side == "B" and h >= entry_level:
+                            entry_idx = idx
+                            break
+                        if side == "S" and l <= entry_level:
+                            entry_idx = idx
+                            break
+
+                    if entry_idx is None:
+                        print(f"  -> {side} pending not filled for the day")
+                        continue
+
+                    print(
+                        f"  -> {side} Entry filled at {df.loc[entry_idx, 'time']}, "
+                        f"price={entry_level:.5f}"
+                    )
+
+                    sim_setup = {
+                        "side": side,
+                        "sl": sl,
+                        "tp": tp,
+                        "lot_size": lot,
+                        "entry_mode": setup.get("entry_mode", ""),
+                    }
+
+                    active_trade_open = True
+
+                    trade = self._simulate_trade(
+                        df=df,
+                        setup=sim_setup,
+                        entry_idx=entry_idx,
+                        actual_entry=entry_level,
+                    )
+
+                    active_trade_open = False
+                    last_exit_time = trade["exit_time"]
+                    day_max_lot = max(day_max_lot, float(lot))
+
+                    print(
+                        f"  -> {side} Exit {trade['result']} at {trade['exit_time']}, "
+                        f"price={trade['exit_price']:.5f}, "
+                        f"PNL=${trade['pnl_amount']:.2f}, Fund=${trade['fund_after']:.2f}"
+                    )
+
+                    day_trade_count += 1
+                    day_profit += trade["pnl_amount"]
+                    if trade["result"] == "tp":
+                        day_tp_hits += 1
+
+                    if trade and trade.get("entry_time") and trade.get("exit_time"):
+                        duration = trade["exit_time"] - trade["entry_time"]
+                        if duration > timedelta(hours=2):
+                            self.long_duration_trades.append(
+                                {
+                                    "date": trade["entry_time"].date(),
+                                    "pair": trade.get("pair", self.pair),
+                                    "side": trade.get("side", side),
+                                    "entry_time": trade["entry_time"],
+                                    "exit_time": trade["exit_time"],
+                                    "duration_hours": round(
+                                        duration.total_seconds() / 3600, 2
+                                    ),
+                                }
+                            )
+
+                    if getattr(self, "stop_requested", False):
+                        print(
+                            YELLOW
+                            + "  -> Global stop triggered (fund <= 0), terminating backtest"
+                            + RESET
+                        )
+                        break
+
+            self.daily_briefings.append(
+                {
+                    "date": day,
+                    "open_balance": round(day_open_balance, 2),
+                    "risk_percent": round(day_risk_percent, 2) if day_risk_percent is not None else 0.0,
+                    "no_trades": day_trade_count,
+                    "tp_hits": day_tp_hits,
+                    "max_lot": round(day_max_lot, 2),
+                    "profit": round(day_profit, 2),
+                    "final_balance": round(self.current_fund, 2),
+                }
+            )
+
             if getattr(self, "stop_requested", False):
                 break
 
-        # Win rate
+        # ---------- FINAL STATS (with SL_BE) ----------
         wins = sum(1 for t in self.trades if t["result"] == "tp")
+        sl_lock10 = sum(1 for t in self.trades if t["result"] == "sl_lock10")
+        losses = sum(1 for t in self.trades if t["result"] == "sl")
+
         if self.total_trades > 0:
+            # Win rate: TP / total trades (BE included in denominator, but not numerator)
             self.win_rate = wins / self.total_trades * 100.0
 
-        losses = sum(1 for t in self.trades if t["result"] == "sl")
         print(
             f"\nTOTAL TRADES: {self.total_trades}, "
-            f"WINS (TP): {wins}, LOSSES (SL): {losses}"
+            f"WINS (TP): {wins}, SL_LOCK10: {sl_lock10}, LOSSES (SL): {losses}"
         )
 
-    def generate_signal_for_latest_day(self, pair: str, df_1h: pd.DataFrame):
-        """
-        Live use ke liye:
-        - df_1h: MT5 se aaya latest 1H data (columns: datetime, open, high, low, close)
-        - Sirf last day ka ORB+Gann signal nikalta hai
-        Return:
-            {
-              "day": date,
-              "side": "B"/"S",
-              "entry": float,
-              "sl": float,
-              "tp": float,
-              "lot": float,
+        print(
+            f"FINAL FUND: ${self.current_fund:,.2f} "
+            f"({self._human_amount(self.current_fund)})"
+        )
+
+        print("\n=== DAY WISE BRIEFING ===")
+        for idx, d in enumerate(self.daily_briefings, start=1):
+            print(
+                f"Day: {idx} | Date: {d['date']} | "
+                f"Open Bal: ${d['open_balance']:,.2f} | "
+                f"Risk%: {d['risk_percent']:.2f}% | "
+                f"No Trades: {d['no_trades']} | "
+                f"TP Hits: {d['tp_hits']} | "
+                f"Max Lot: {d['max_lot']:.2f} | "
+                f"Profit: ${d['profit']:,.2f} | "
+                f"Final Balance: ${d['final_balance']:,.2f}"
+            )
+
+        print("\n=== LONG DURATION TRADES (> 2 hours) ===")
+        if self.long_duration_trades:
+            print("DATE / PAIR / SIDE / ENTRY TIME / EXIT TIME / DURATION_HOURS")
+            for t in self.long_duration_trades:
+                print(
+                    f"{t['date']} / {t['pair']} / {t['side']} / "
+                    f"{t['entry_time']} / {t['exit_time']} / {t['duration_hours']}"
+                )
+        else:
+            print("None")
+
+        print("\n=== MAXIMUM LOSS WHILE OPEN (MAE) TRADES ===")
+        mae_trades = [
+            t for t in self.trades
+            if "max_adverse_amount" in t and t["max_adverse_amount"] is not None
+        ]
+
+        if not mae_trades:
+            print("No MAE data available (did you paste updated _simulate_trade?)")
+            return
+
+        mae_trades_sorted = sorted(
+            mae_trades,
+            key=lambda x: (
+                x.get("date"),
+                -float(x.get("max_adverse_amount", 0.0))
+            ),
+        )
+
+        print(
+            "DATE / PAIR / SIDE / RESULT / BAL_BEFORE / MAE_AMOUNT / MAE_PIPS / MIN_AVAIL_BAL / ENTRY_TIME / EXIT_TIME"
+        )
+        for t in mae_trades_sorted:
+            line = (
+                f"{t['date']} / {t['pair']} / {t['side']} / {t['result']} / "
+                f"${t.get('balance_before_trade', 0.0):,.2f} / "
+                f"${t.get('max_adverse_amount', 0.0):,.2f} / "
+                f"{t.get('max_adverse_pips', 0.0):.1f} / "
+                f"${t.get('min_available_balance_during_trade', 0.0):,.2f} / "
+                f"{t.get('entry_time')} / {t.get('exit_time')}"
+            )
+
+            if float(t.get("min_available_balance_during_trade", 0.0)) < 0:
+                print(RED + line + RESET)
+            else:
+                print(line)
+
+        # >>> LAST BLOCK: HUMAN SUMMARY <<<
+        last_lot = (
+            self.trades[-1].get("lot_size", 0.0)
+            if self.trades else 0.0
+        )
+
+        print(
+            f'\nSUMMARY: Executed {self.total_trades} trades '
+            f'({wins} TP, {sl_lock10} SL_LOCK10, {losses} SL), final fund '
+            f'${self.current_fund:,.2f} '
+            f'({self._human_amount(self.current_fund)}), '
+            f'last lot {last_lot:.2f}.'
+        )
+
+    def _human_amount(self, n: float) -> str:
+        n = float(n)
+        abs_n = abs(n)
+
+        if abs_n >= 1_000_000_000_000:
+            return f"{n / 1_000_000_000_000:.2f} trillion"
+        elif abs_n >= 1_000_000_000:
+            return f"{n / 1_000_000_000:.2f} billion"
+        elif abs_n >= 1_000_000:
+            return f"{n / 1_000_000:.2f} million"
+        elif abs_n >= 1_000:
+            return f"{n / 1_000:.2f} thousand"
+        else:
+            return f"{n:.2f}"
+
+    def _ensure_registry_file(self):
+        os.makedirs(REGISTRY_DIR, exist_ok=True)
+        if not os.path.exists(REGISTRY_FILE):
+            with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
+                json.dump({}, f, indent=2)
+
+    def _load_live_registry(self) -> Dict:
+        self._ensure_registry_file()
+        try:
+            with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            print(f"  -> Registry load failed: {e}")
+            return {}
+
+    def _save_live_registry(self, data: Dict):
+        self._ensure_registry_file()
+        with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+
+    def _fmt_live_ts(self, x):
+        if x is None:
+            return ""
+        try:
+            return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(x)
+
+    def _live_signal_expiry_server(self, day):
+        return datetime.combine(day, time(23, 50))
+
+    def _make_signal_id_from_setup(self, pair: str, day, setup: dict) -> str:
+        side = str(setup.get("side", "")).strip().upper()
+        trigger = self._fmt_live_ts(setup.get("trigger_time")).replace(
+            " ", "_").replace(":", "-")
+        entry = round(float(setup.get("entry", 0.0)), 5)
+        sl = round(float(setup.get("sl", 0.0)), 5)
+        tp = round(float(setup.get("tp", 0.0)), 5)
+        return f"{pair}_{day}_{side}_{trigger}_{entry:.5f}_{sl:.5f}_{tp:.5f}"
+
+    def _mark_signal_completed_in_registry(self, signal_id: str, trade: Dict):
+        reg = self._load_live_registry()
+        if signal_id not in reg:
+            reg[signal_id] = {"signal_id": signal_id}
+
+        result = str(trade.get("result", "")).lower()
+        reg[signal_id]["entry_hit"] = True
+        reg[signal_id]["exit_result"] = result
+        reg[signal_id]["entry_time"] = str(trade.get("entry_time", ""))
+        reg[signal_id]["exit_time"] = str(trade.get("exit_time", ""))
+        reg[signal_id]["registry_status"] = "COMPLETED"
+        reg[signal_id]["completed"] = True
+        reg[signal_id]["last_updated"] = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S")
+        self._save_live_registry(reg)
+
+    def _mark_signal_non_completed_in_registry(self, signal_id: str, status: str):
+        reg = self._load_live_registry()
+        if signal_id not in reg:
+            reg[signal_id] = {"signal_id": signal_id}
+
+        reg[signal_id]["registry_status"] = str(status).upper()
+        reg[signal_id]["completed"] = False
+        reg[signal_id]["last_updated"] = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S")
+        self._save_live_registry(reg)
+
+    def _is_signal_completed_in_registry(self, signal_id: str) -> bool:
+        reg = self._load_live_registry()
+        row = reg.get(signal_id, {})
+        return bool(row.get("completed", False))
+
+    def _is_same_completed_trade_prices(
+        self,
+        pair: str,
+        day,
+        side: str,
+        entry: float,
+        sl: float,
+        tp: float,
+        price_tol: float = 0.00005,
+    ) -> bool:
+        reg = self._load_live_registry()
+        day_str = str(day)
+
+        def _as_float(x, default=0.0):
+            try:
+                return float(x)
+            except Exception:
+                return default
+
+        def _same_price(a, b):
+            return abs(_as_float(a) - _as_float(b)) <= price_tol
+
+        for _, row in reg.items():
+            row_pair = str(row.get("pair", "")).strip()
+            row_day = str(row.get("day", "")).strip()
+            row_side = str(row.get("side", "")).strip().upper()
+            row_completed = bool(row.get("completed", False))
+            row_status = str(row.get("registry_status", "")).strip().upper()
+
+            if row_pair != pair:
+                continue
+            if row_day != day_str:
+                continue
+            if row_side != side.upper():
+                continue
+            if not (row_completed or row_status == "COMPLETED"):
+                continue
+
+            row_entry = row.get("entry", 0.0)
+            row_sl = row.get("sl", 0.0)
+            row_tp = row.get("tp", 0.0)
+
+            if _same_price(row_entry, entry) and _same_price(row_sl, sl) and _same_price(row_tp, tp):
+                return True
+
+        return False
+
+    def _has_any_completed_trade_for_pair_day(self, pair: str, day) -> bool:
+        reg = self._load_live_registry()
+        day_str = str(day)
+
+        for _, row in reg.items():
+            row_pair = str(row.get("pair", "")).strip()
+            row_day = str(row.get("day", "")).strip()
+            row_completed = bool(row.get("completed", False))
+            row_status = str(row.get("registry_status", "")).strip().upper()
+
+            if row_pair != pair:
+                continue
+            if row_day != day_str:
+                continue
+
+            if row_completed or row_status == REGISTRY_STATUS_COMPLETED:
+                return True
+
+        return False
+
+    def _has_active_registry_signal_for_pair_day_side(self, pair: str, day, side: str) -> bool:
+        reg = self._load_live_registry()
+        day_str = str(day)
+        side = str(side).strip().upper()
+
+        active_statuses = {
+            "GENERATED",
+            "NEW",
+            "PLACED",
+            "ENTRY_HIT",
+            "BE_APPLIED",
+            "LOCK10_APPLIED",
+            "ACTIVE",
+        }
+
+        for _, row in reg.items():
+            row_pair = str(row.get("pair", "")).strip()
+            row_day = str(row.get("day", "")).strip()
+            row_side = str(row.get("side", "")).strip().upper()
+            row_completed = bool(row.get("completed", False))
+            row_status = str(row.get("registry_status", "")).strip().upper()
+
+            if row_pair != pair:
+                continue
+            if row_day != day_str:
+                continue
+            if row_side != side:
+                continue
+            if row_completed:
+                continue
+
+            if row_status in active_statuses:
+                return True
+
+        return False
+
+    def _is_setup_in_hhll_disable_window(self, setup: dict) -> bool:
+        if not setup:
+            return False
+
+        trigger_time = setup.get("trigger_time")
+        if trigger_time is None:
+            return False
+
+        try:
+            trigger_time = pd.to_datetime(trigger_time)
+        except Exception:
+            return False
+
+        t = trigger_time.time()
+        return self.hhll_disable_start_server <= t < self.hhll_disable_end_server
+
+    def _parse_registry_ts(self, x):
+        if x is None or str(x).strip() == "":
+            return None
+        try:
+            return pd.to_datetime(x)
+        except Exception:
+            return None
+
+    def _get_signal_expiry_from_row(self, row: Dict):
+        day_str = str(row.get("day", "")).strip()
+        if not day_str:
+            return None
+        try:
+            day_dt = pd.to_datetime(day_str).date()
+            return self._live_signal_expiry_server(day_dt)
+        except Exception:
+            return None
+
+    def _scan_signal_outcome_from_df(self, df: pd.DataFrame, row: Dict):
+        if df is None or df.empty:
+            return None
+
+        df = df.copy()
+        df["time"] = pd.to_datetime(df["time"])
+        df = df.sort_values("time").reset_index(drop=True)
+
+        side = str(row.get("side", "")).upper().strip()
+        entry = float(row.get("entry", 0.0))
+        sl = float(row.get("sl", 0.0))
+        tp = float(row.get("tp", 0.0))
+        trigger_time = self._parse_registry_ts(row.get("trigger_time"))
+
+        if trigger_time is None:
+            return None
+
+        expiry_time = self._get_signal_expiry_from_row(row)
+        if expiry_time is None:
+            expiry_time = df["time"].max()
+
+        scan_df = df[df["time"] >= trigger_time].copy()
+        if scan_df.empty:
+            return None
+
+        entry_hit = False
+        entry_time = None
+
+        for _, candle in scan_df.iterrows():
+            t = candle["time"]
+            high = float(candle["high"])
+            low = float(candle["low"])
+
+            if not entry_hit:
+                if t > expiry_time:
+                    return {
+                        "kind": "noncompleted",
+                        "status": REGISTRY_STATUS_ORDER_EXPIRED,
+                    }
+
+                if side == "B" and high >= entry:
+                    entry_hit = True
+                    entry_time = t
+                elif side == "S" and low <= entry:
+                    entry_hit = True
+                    entry_time = t
+                else:
+                    continue
+
+            if side == "B":
+                tp_hit = high >= tp
+                sl_hit = low <= sl
+            else:
+                tp_hit = low <= tp
+                sl_hit = high >= sl
+
+            if tp_hit and sl_hit:
+                resolved = self._resolve_same_candle_exit_with_m1(
+                    side=side,
+                    entry_time=entry_time,
+                    actual_entry=entry,
+                    sl=sl,
+                    tp=tp,
+                )
+
+                if resolved is not None:
+                    resolved_result = str(resolved.get("result", "")).lower()
+                    resolved_exit_time = resolved.get("exit_time")
+
+                    if resolved_result == RESULT_TP:
+                        return {
+                            "kind": "completed",
+                            "trade": {
+                                "result": RESULT_TP,
+                                "entry_time": entry_time,
+                                "exit_time": resolved_exit_time,
+                            },
+                        }
+
+                    if resolved_result == RESULT_SL:
+                        return {
+                            "kind": "completed",
+                            "trade": {
+                                "result": RESULT_SL,
+                                "entry_time": entry_time,
+                                "exit_time": resolved_exit_time,
+                            },
+                        }
+
+                    if resolved_result == RESULT_SESSION_EXIT:
+                        return {
+                            "kind": "noncompleted",
+                            "status": REGISTRY_STATUS_ORDER_EXPIRED
+                            if t >= expiry_time
+                            else REGISTRY_STATUS_ENTRY_HIT,
+                        }
+
+            if tp_hit:
+                return {
+                    "kind": "completed",
+                    "trade": {
+                        "result": RESULT_TP,
+                        "entry_time": entry_time,
+                        "exit_time": t,
+                    },
+                }
+
+            if sl_hit:
+                return {
+                    "kind": "completed",
+                    "trade": {
+                        "result": RESULT_SL,
+                        "entry_time": entry_time,
+                        "exit_time": t,
+                    },
+                }
+
+        if not entry_hit and df["time"].max() >= expiry_time:
+            return {
+                "kind": "noncompleted",
+                "status": REGISTRY_STATUS_ORDER_EXPIRED,
             }
-            ya None agar koi trade nahi.
+
+        if entry_hit:
+            reg = self._load_live_registry()
+            signal_id = str(row.get("signal_id", "")).strip()
+            if signal_id in reg:
+                reg[signal_id]["entry_hit"] = True
+                reg[signal_id]["entry_time"] = str(entry_time)
+                reg[signal_id]["registry_status"] = REGISTRY_STATUS_ENTRY_HIT
+                reg[signal_id]["last_updated"] = datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S")
+                self._save_live_registry(reg)
+
+        return None
+
+    def _reconcile_open_registry_signals_with_market_data(self, pair: str, df: pd.DataFrame):
+        reg = self._load_live_registry()
+        if not reg:
+            return
+
+        for signal_id, row in list(reg.items()):
+            row_pair = str(row.get("pair", "")).strip()
+            if row_pair != pair:
+                continue
+
+            status = str(row.get("registry_status", "GENERATED")
+                         ).upper().strip()
+            completed = bool(row.get("completed", False))
+
+            if completed:
+                continue
+
+            if status in ("COMPLETED", "FAILED", "ORDEREXPIRED1930", "CANCELLEDNEWHHLL", "CANCELLED_NEW_HH_LL"):
+                continue
+
+            outcome = self._scan_signal_outcome_from_df(df=df, row=row)
+            if not outcome:
+                continue
+
+            if outcome["kind"] == "completed":
+                self._mark_signal_completed_in_registry(
+                    signal_id, outcome["trade"])
+                print(
+                    f"  -> Registry completed: {signal_id} -> {outcome['trade']['result']}")
+            elif outcome["kind"] == "noncompleted":
+                self._mark_signal_non_completed_in_registry(
+                    signal_id, outcome["status"])
+                print(
+                    f"  -> Registry non-completed: {signal_id} -> {outcome['status']}")
+
+    def _is_same_live_payload(self, existing: Optional[Dict], payload: Dict) -> bool:
+        if not existing or not payload:
+            return False
+
+        def _as_float(v, default=0.0):
+            try:
+                return float(v)
+            except Exception:
+                return default
+
+        def _price_same(a, b, tol=0.00005):
+            return abs(_as_float(a) - _as_float(b)) <= tol
+
+        def _lot_same(a, b, tol=0.005):
+            return abs(_as_float(a) - _as_float(b)) <= tol
+
+        same_symbol = str(existing.get("symbol", "")).strip() == str(
+            payload.get("symbol", "")).strip()
+        same_side = str(existing.get("side", "")).strip().upper() == str(
+            payload.get("side", "")).strip().upper()
+        same_expiry = str(existing.get("expiry_server", "")).strip() == str(
+            payload.get("expiry_server", "")).strip()
+
+        same_entry = _price_same(existing.get(
+            "entry", 0.0), payload.get("entry", 0.0))
+        same_sl = _price_same(existing.get("sl", 0.0), payload.get("sl", 0.0))
+        same_tp = _price_same(existing.get("tp", 0.0), payload.get("tp", 0.0))
+        same_lot = _lot_same(existing.get("lot", 0.0), payload.get("lot", 0.0))
+        same_mode = str(existing.get("entry_mode", "")).strip() == str(
+            payload.get("entry_mode", "")).strip()
+
+        return (
+            same_symbol and
+            same_side and
+            same_expiry and
+            same_entry and
+            same_sl and
+            same_tp and
+            same_lot and
+            same_mode
+        )
+
+    def _cancel_existing_signal_strict(
+        self,
+        pair: str,
+        day,
+        signal_file: str,
+        existing: Optional[Dict],
+        max_spread_points: int,
+        max_slippage_points: int,
+        reason: str = "CANCELLEDNEWHHLL",
+    ):
         """
+        STRICT DELETE: cancel payload + registry mark.
+        Filled/managed trades untouched.
+        CANCEL file ko delete nahi karte, taaki EA usko read kar sake.
+        """
+        if existing is None:
+            # No payload, just delete file if present (pure stale)
+            try:
+                if os.path.exists(signal_file):
+                    os.remove(signal_file)
+                    print(
+                        f"  -> Deleted file (no existing payload): {signal_file}")
+            except Exception as e:
+                print(f"  -> Failed deleting file {signal_file}: {e}")
+            return
+
+        existing_status = str(existing.get("status", "")).upper()
+        if existing_status in TERMINAL_FILLED_STATUSES:
+            print(
+                f"  -> Existing filled status {existing_status}, skip strict cancel: {signal_file}"
+            )
+            return
+
+        old_signal_id = str(existing.get("signal_id", "")).strip()
+
+        # 1) Write CANCEL payload so EA sees proper cancel once
+        cancel_payload = self._build_live_cancel_payload(
+            pair=pair,
+            day=day,
+            max_spread_points=max_spread_points,
+            max_slippage_points=max_slippage_points,
+        )
+        self._write_live_signal_file(signal_file, cancel_payload)
+
+        # 2) Registry -> mark as non-completed / cancelled
+        if old_signal_id:
+            self._mark_signal_non_completed_in_registry(old_signal_id, reason)
+
+        # 3) CANCEL file ko intentionally rakho, delete mat karo
+        print(f"  -> Strict cancel file kept for EA processing: {signal_file}")
+
+    def _write_fresh_signal_after_strict_delete(
+        self,
+        pair: str,
+        day,
+        signal_file: str,
+        setup: dict,
+        existing: Optional[Dict],
+        existing_status: str,
+        max_spread_points: int,
+        max_slippage_points: int,
+        reason: str = "CANCELLEDNEWHHLL",
+    ):
+        print(f"\n[FRESH DBG] ENTER pair={pair} file={signal_file}")
+        print(f"[FRESH DBG] day={day}")
+        print(f"[FRESH DBG] existing_status(raw)={existing_status}")
+        print(f"[FRESH DBG] existing={existing}")
+        print(f"[FRESH DBG] setup={setup}")
+
+        existing_status = str(existing_status or "").upper()
+        setup_side = str(setup.get("side", "")).upper().strip()
+
+        print(f"[FRESH DBG] existing_status(norm)={existing_status}")
+        print(f"[FRESH DBG] setup_side={setup_side}")
+
+        # 0) Pair/day/side completed lock (NO NEW HELPER)
+        reg = self._load_live_registry()
+        day_str = str(day)
+        same_side_completed = False
+
+        for _, row in reg.items():
+            row_pair = str(row.get("pair", "")).strip()
+            row_day = str(row.get("day", "")).strip()
+            row_side = str(row.get("side", "")).strip().upper()
+            row_completed = bool(row.get("completed", False))
+            row_status = str(row.get("registry_status", "")).strip().upper()
+
+            if row_pair != pair:
+                continue
+            if row_day != day_str:
+                continue
+            if row_side != setup_side:
+                continue
+
+            if row_completed or row_status == "COMPLETED":
+                same_side_completed = True
+                break
+
+        if same_side_completed:
+            print(
+                f"[FRESH DBG] pair/day/side completed lock hit -> skip {pair} {day} side={setup_side}"
+            )
+            return None
+
+        # 0.5) Side-wise active registry guard
+        has_active_same_side = self._has_active_registry_signal_for_pair_day_side(
+            pair, day, setup_side)
+        print(
+            f"[FRESH DBG] has_active_registry_signal_for_pair_day_side={has_active_same_side}")
+
+        if has_active_same_side:
+            same_existing_side = (
+                str(existing.get("side", "")).upper().strip() if existing else ""
+            )
+            same_existing_status = (
+                str(existing.get("status", "")).upper(
+                ).strip() if existing else ""
+            )
+
+            print(f"[FRESH DBG] same_existing_side={same_existing_side}")
+            print(f"[FRESH DBG] same_existing_status={same_existing_status}")
+            print(f"[FRESH DBG] ACTIVE_FILE_STATUSES={ACTIVE_FILE_STATUSES}")
+
+            if (
+                not existing
+                or same_existing_side != setup_side
+                or same_existing_status not in ACTIVE_FILE_STATUSES
+            ):
+                print(
+                    f"[FRESH DBG] active registry guard blocked fresh write for {pair} {day} side={setup_side}"
+                )
+                return None
+
+        # 1) Registry completed filters (exact ID + same prices)
+        signal_id = self._make_signal_id_from_setup(pair, day, setup)
+        print(f"[FRESH DBG] signal_id={signal_id}")
+
+        already_completed_exact = self._is_signal_completed_in_registry(
+            signal_id)
+        already_completed_same_prices = self._is_same_completed_trade_prices(
+            pair=pair,
+            day=day,
+            side=setup_side,
+            entry=float(setup.get("entry", 0.0)),
+            sl=float(setup.get("sl", 0.0)),
+            tp=float(setup.get("tp", 0.0)),
+        )
+
+        print(f"[FRESH DBG] already_completed_exact={already_completed_exact}")
+        print(
+            f"[FRESH DBG] already_completed_same_prices={already_completed_same_prices}")
+
+        if already_completed_exact or already_completed_same_prices:
+            print(
+                f"[FRESH DBG] setup already completed in registry -> skip fresh write: {signal_id}"
+            )
+            return None
+
+        # 2) Existing file terminal-filled guard
+        print(
+            f"[FRESH DBG] TERMINAL_FILLED_STATUSES={TERMINAL_FILLED_STATUSES}")
+        if existing_status in TERMINAL_FILLED_STATUSES:
+            print("[FRESH DBG] existing trade already filled/managed -> no overwrite")
+            return None
+
+        # 3) Build PLACE payload (registry inside)
+        payload = self._build_live_place_payload(
+            pair=pair,
+            day=day,
+            setup=setup,
+            action="PLACE",
+            max_spread_points=max_spread_points,
+            max_slippage_points=max_slippage_points,
+        )
+
+        print(f"[FRESH DBG] payload from _build_live_place_payload={payload}")
+
+        if payload is None:
+            print("[FRESH DBG] payload is None -> no live file write")
+            return None
+
+        # 4) If existing ACTIVE file + same payload, no rewrite
+        if existing is not None and existing_status in ACTIVE_FILE_STATUSES:
+            same_payload = self._is_same_live_payload(existing, payload)
+            print(f"[FRESH DBG] existing active file detected")
+            print(f"[FRESH DBG] existing_status in ACTIVE_FILE_STATUSES -> True")
+            print(f"[FRESH DBG] same_payload={same_payload}")
+            print(f"[FRESH DBG] existing payload={existing}")
+            print(f"[FRESH DBG] new payload={payload}")
+
+            if same_payload:
+                print(
+                    "[FRESH DBG] chosen setup unchanged (prices/lot/mode) -> no rewrite")
+                return payload
+
+            # 5) Material change -> strict cancel + rewrite
+            print("[FRESH DBG] chosen setup changed materially -> STRICT DELETE flow")
+            self._cancel_existing_signal_strict(
+                pair=pair,
+                day=day,
+                signal_file=signal_file,
+                existing=existing,
+                max_spread_points=max_spread_points,
+                max_slippage_points=max_slippage_points,
+                reason=reason,
+            )
+            print("[FRESH DBG] strict cancel completed")
+
+        else:
+            print(
+                "[FRESH DBG] no active existing file branch, proceeding to final write")
+
+        # 6) Final write
+        print(f"[FRESH DBG] calling _write_live_signal_file for {signal_file}")
+        self._write_live_signal_file(signal_file, payload)
+        print(f"[FRESH DBG] final write done for {signal_file}")
+
+        return payload
+
+    def _build_live_cancel_payload(self, pair: str, day, max_spread_points=25, max_slippage_points=15):
+        return {
+            "action": "CANCEL",
+            "signal_id": f"{pair}_{day}_CANCEL",
+            "symbol": pair,
+            "side": "",
+            "expiry_server": self._live_signal_expiry_server(day).strftime("%Y-%m-%d %H:%M:%S"),
+            "entry": 0.0,
+            "sl": 0.0,
+            "tp": 0.0,
+            "lot": 0.0,
+            "entry_mode": "",
+            "atr": 0.0,
+            "trigger_time": "",
+            "picked_candle_time": "",
+            "breakout_candle_time": "",
+            "status": "NEW",
+            "max_spread_points": int(max_spread_points),
+            "max_slippage_points": int(max_slippage_points),
+        }
+
+    def _build_live_place_payload(
+        self,
+        pair: str,
+        day,
+        setup: dict,
+        action: str = "PLACE",
+        max_spread_points=25,
+        max_slippage_points=15,
+    ):
+        trigger_time = self._fmt_live_ts(setup.get("trigger_time"))
+        picked_candle_time = self._fmt_live_ts(setup.get("picked_candle_time"))
+        breakout_candle_time = self._fmt_live_ts(
+            setup.get("breakout_candle_time"))
+
+        entry = round(float(setup["entry"]), 5)
+        sl = round(float(setup["sl"]), 5)
+        tp = round(float(setup["tp"]), 5)
+        atr = round(float(setup.get("atr", 0.0)), 5)
+        lot = round(float(setup["lot_size"]), 2)
+        side = str(setup.get("side", "")).upper().strip()
+
+        signal_id = self._make_signal_id_from_setup(pair, day, setup)
+
+        already_completed_exact = self._is_signal_completed_in_registry(
+            signal_id)
+        already_completed_same_prices = self._is_same_completed_trade_prices(
+            pair=pair,
+            day=day,
+            side=side,
+            entry=entry,
+            sl=sl,
+            tp=tp,
+        )
+
+        if already_completed_exact or already_completed_same_prices:
+            print(
+                f" -> Registry says completed, skip payload build: {signal_id}")
+            return None
+
+        reg = self._load_live_registry()
+        row = reg.get(signal_id, {})
+
+        row_completed = bool(row.get("completed", False))
+        row_status = str(row.get("registry_status", "")).upper().strip()
+
+        if row_completed or row_status == "COMPLETED":
+            print(
+                f" -> Existing registry row already completed, skip payload build: {signal_id}")
+            return None
+
+        reg[signal_id] = {
+            "signal_id": signal_id,
+            "pair": pair,
+            "day": str(day),
+            "side": side,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "atr": atr,
+            "completed": False,
+            "trigger_time": trigger_time,
+            "picked_candle_time": picked_candle_time,
+            "breakout_candle_time": breakout_candle_time,
+            "registry_status": row_status if row_status and row_status != "COMPLETED" else "GENERATED",
+            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        self._save_live_registry(reg)
+        print(f" -> Registry signal added/updated: {signal_id}")
+
+        return {
+            "action": action,
+            "signal_id": signal_id,
+            "symbol": pair,
+            "side": side,
+            "expiry_server": self._live_signal_expiry_server(day).strftime("%Y-%m-%d %H:%M:%S"),
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "lot": lot,
+            "entry_mode": str(setup.get("entry_mode", "")),
+            "atr": atr,
+            "trigger_time": trigger_time,
+            "picked_candle_time": picked_candle_time,
+            "breakout_candle_time": breakout_candle_time,
+            "status": "NEW",
+            "max_spread_points": int(max_spread_points),
+            "max_slippage_points": int(max_slippage_points),
+        }
+
+    def _live_payload_to_line(self, payload: dict) -> str:
+        return "|".join([
+            str(payload.get("action", "")),
+            str(payload.get("signal_id", "")),
+            str(payload.get("symbol", "")),
+            str(payload.get("side", "")),
+            str(payload.get("expiry_server", "")),
+            f"{float(payload.get('entry', 0.0)):.5f}",
+            f"{float(payload.get('sl', 0.0)):.5f}",
+            f"{float(payload.get('tp', 0.0)):.5f}",
+            f"{float(payload.get('lot', 0.0)):.2f}",
+            str(payload.get("entry_mode", "")),
+            f"{float(payload.get('atr', 0.0)):.5f}",
+            str(payload.get("trigger_time", "")),
+            str(payload.get("picked_candle_time", "")),
+            str(payload.get("breakout_candle_time", "")),
+            str(payload.get("status", "NEW")),
+            str(int(payload.get("max_spread_points", 25))),
+            str(int(payload.get("max_slippage_points", 15))),
+        ])
+
+    def _read_existing_live_signal(self, signal_file: str):
+        if not os.path.exists(signal_file):
+            return None, None
+
+        try:
+            with open(signal_file, "r", encoding="utf-8") as f:
+                line = f.read().strip()
+        except Exception:
+            return None, None
+
+        if not line:
+            return None, None
+
+        parts = line.split("|")
+
+        # Extended format: 23 fields
+        # PLACE|signal_id|day|side|trigger_time|entry|sl|tp|symbol|side|expiry|entry|sl|tp|lot|entry_mode|atr|trigger|picked|breakout|status|spread|slip
+        if len(parts) >= 23:
+            payload = {
+                "action": parts[0],
+                "signal_id": parts[1],
+                "symbol": parts[8],
+                "side": parts[9],
+                "expiry_server": parts[10],
+                "entry": parts[11],
+                "sl": parts[12],
+                "tp": parts[13],
+                "lot": parts[14],
+                "entry_mode": parts[15],
+                "atr": parts[16],
+                "trigger_time": parts[17],
+                "picked_candle_time": parts[18],
+                "breakout_candle_time": parts[19],
+                "status": parts[20],
+                "max_spread_points": parts[21],
+                "max_slippage_points": parts[22],
+            }
+            return line, payload
+
+        # New compact ATR format: 17 fields
+        if len(parts) >= 17:
+            payload = {
+                "action": parts[0],
+                "signal_id": parts[1],
+                "symbol": parts[2],
+                "side": parts[3],
+                "expiry_server": parts[4],
+                "entry": parts[5],
+                "sl": parts[6],
+                "tp": parts[7],
+                "lot": parts[8],
+                "entry_mode": parts[9],
+                "atr": parts[10],
+                "trigger_time": parts[11],
+                "picked_candle_time": parts[12],
+                "breakout_candle_time": parts[13],
+                "status": parts[14],
+                "max_spread_points": parts[15],
+                "max_slippage_points": parts[16],
+            }
+            return line, payload
+
+        # Old compact format: 16 fields
+        if len(parts) >= 16:
+            payload = {
+                "action": parts[0],
+                "signal_id": parts[1],
+                "symbol": parts[2],
+                "side": parts[3],
+                "expiry_server": parts[4],
+                "entry": parts[5],
+                "sl": parts[6],
+                "tp": parts[7],
+                "lot": parts[8],
+                "entry_mode": parts[9],
+                "atr": "0.00000",
+                "trigger_time": parts[10],
+                "picked_candle_time": parts[11],
+                "breakout_candle_time": parts[12],
+                "status": parts[13],
+                "max_spread_points": parts[14],
+                "max_slippage_points": parts[15],
+            }
+            return line, payload
+
+        # Very old format: 14 fields
+        if len(parts) >= 14:
+            payload = {
+                "action": parts[0],
+                "signal_id": parts[1],
+                "symbol": parts[2],
+                "side": parts[3],
+                "expiry_server": parts[4],
+                "entry": parts[5],
+                "sl": parts[6],
+                "tp": parts[7],
+                "lot": parts[8],
+                "entry_mode": parts[9],
+                "atr": "0.00000",
+                "trigger_time": parts[10],
+                "picked_candle_time": "",
+                "breakout_candle_time": "",
+                "status": parts[11],
+                "max_spread_points": parts[12],
+                "max_slippage_points": parts[13],
+            }
+            return line, payload
+
+        return line, None
+
+    def _write_live_signal_file(self, signal_file: str, payload: dict):
+        print(f"\n[WRITE DBG] ENTER _write_live_signal_file")
+        print(f"[WRITE DBG] signal_file = {signal_file}")
+        print(f"[WRITE DBG] abs_path = {os.path.abspath(signal_file)}")
+        print(f"[WRITE DBG] cwd = {os.getcwd()}")
+        print(f"[WRITE DBG] payload = {payload}")
+
+        new_line = self._live_payload_to_line(payload)
+        print(f"[WRITE DBG] new_line = {new_line}")
+
+        old_line, existing = self._read_existing_live_signal(signal_file)
+        print(f"[WRITE DBG] old_line = {old_line}")
+        print(f"[WRITE DBG] existing = {existing}")
+
+        if old_line == new_line:
+            print(f"[WRITE DBG] unchanged, skip write: {signal_file}")
+            return False
+
+        if existing is not None and self._is_same_live_payload(existing, payload):
+            print(
+                f"[WRITE DBG] same payload, normalizing file format: {signal_file}")
+        else:
+            print(f"[WRITE DBG] file updated: {signal_file}")
+
+        os.makedirs(os.path.dirname(signal_file), exist_ok=True)
+        with open(signal_file, "w", encoding="utf-8") as f:
+            f.write(new_line)
+
+        # verify immediately from disk
+        with open(signal_file, "r", encoding="utf-8") as f:
+            verify_line = f.read().strip()
+
+        print(f"[WRITE DBG] FINAL WRITTEN LINE = {new_line}")
+        print(f"[WRITE DBG] verify_after_write = {verify_line}")
+        return True
+
+    def _choose_live_setup_for_day(self, day_df: pd.DataFrame, fund: float, risk_percent: float):
+        high_setup = self._build_high_setup_for_day(day_df, fund, risk_percent)
+        low_setup = self._build_low_setup_for_day(day_df, fund, risk_percent)
+
+        candidates = []
+        if high_setup:
+            candidates.append(high_setup)
+        if low_setup:
+            candidates.append(low_setup)
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda s: s["trigger_time"])
+        return candidates[-1]
+
+    def generate_live_dual_signals_for_latest_day(
+        self,
+        pair: str,
+        df_15m: pd.DataFrame,
+        signal_file: str = None,
+        signal_dir: str = None,
+        max_spread_points: int = 25,
+        max_slippage_points: int = 15,
+    ):
         self.pair = pair
 
-        df = df_1h.copy()
-        # MT5 se aane wali datetime column ka naam tu already "datetime" use kar raha hai
+        df = df_15m.copy()
         df["time"] = pd.to_datetime(df["datetime"])
         df = df.sort_values("time").reset_index(drop=True)
 
-        # ATR full df pe
-        df = self._add_atr_column(df)
+        if "atr" not in df.columns:
+            df = self._add_atr_column(df)
 
-        # Latest day choose
+        # IMPORTANT: refresh registry against latest market data for this pair
+        self._reconcile_open_registry_signals_with_market_data(
+            pair=pair, df=df)
+
         day = df["time"].dt.date.max()
-        day_df = df[df["time"].dt.date == day]
+        day_df = df[df["time"].dt.date == day].copy()
 
-        print(f"\n[Signal] {pair} latest day = {day}")
+        print(f"\n[HL Live] {pair} latest day = {day}")
         print(f"  -> Rows in day_df: {len(day_df)}")
 
-        # Basic day validation
-        if not self._validate_day(day_df):
-            print("  -> Day invalid, no signal")
-            return None
+        if signal_dir is None:
+            if signal_file is not None:
+                signal_dir = os.path.dirname(signal_file)
+            else:
+                raise ValueError("signal_dir or signal_file required")
 
-        # ORB + rules
-        orb_info = self._decide_orb(day_df)
-        orb = orb_info["orb"]
-        breakout = orb_info["breakout"]
-        if not orb or not breakout:
-            print("  -> No ORB/breakout, no signal")
-            return None
+        buy_file = os.path.join(signal_dir, f"live_signal_{pair}_BUY.txt")
+        sell_file = os.path.join(signal_dir, f"live_signal_{pair}_SELL.txt")
 
-        print(f"  -> Gann INPUT price: {breakout['input_price']:.5f}")
+        old_buy_line, existing_buy = self._read_existing_live_signal(buy_file)
+        old_sell_line, existing_sell = self._read_existing_live_signal(
+            sell_file)
 
-        # Gann levels from local lookup
-        gann_levels = self._get_gann_from_lookup(breakout["input_price"])
-        if not gann_levels:
-            print("  -> Gann lookup failed, no signal")
-            return None
+        def _is_existing_from_old_day(existing_payload, current_day):
+            if existing_payload is None:
+                return False
+
+            existing_signal_id = str(
+                existing_payload.get("signal_id", "")).strip()
+            existing_expiry = str(existing_payload.get(
+                "expiry_server", "")).strip()
+            day_str = str(current_day)
+
+            return day_str not in existing_signal_id and day_str not in existing_expiry
+
+        # stale old-day BUY file/payload ignore
+        if _is_existing_from_old_day(existing_buy, day):
+            print(
+                f"  -> Existing BUY file belongs to old day, treating as stale: {buy_file}")
+            existing_buy = None
+
+        # stale old-day SELL file/payload ignore
+        if _is_existing_from_old_day(existing_sell, day):
+            print(
+                f"  -> Existing SELL file belongs to old day, treating as stale: {sell_file}")
+            existing_sell = None
+
+        existing_buy_status = str(existing_buy.get(
+            "status", "")).upper() if existing_buy else ""
+        existing_sell_status = str(existing_sell.get(
+            "status", "")).upper() if existing_sell else ""
+
+        if day_df.empty or not self._validate_day(day_df):
+            print("  -> Day invalid")
+
+            if existing_buy_status not in TERMINAL_FILLED_STATUSES:
+                self._cancel_existing_signal_strict(
+                    pair=pair,
+                    day=day,
+                    signal_file=buy_file,
+                    existing=existing_buy,
+                    max_spread_points=max_spread_points,
+                    max_slippage_points=max_slippage_points,
+                    reason="CANCELLEDEOD",
+                )
+
+            if existing_sell_status not in TERMINAL_FILLED_STATUSES:
+                self._cancel_existing_signal_strict(
+                    pair=pair,
+                    day=day,
+                    signal_file=sell_file,
+                    existing=existing_sell,
+                    max_spread_points=max_spread_points,
+                    max_slippage_points=max_slippage_points,
+                    reason="CANCELLEDEOD",
+                )
+
+            return {"buy": None, "sell": None}
 
         fund = self.current_fund
-        # Filhaal week ramp simple: base_risk_percent
         risk_percent = self.base_risk_percent
 
-        if breakout["side"] == "B":
-            primary = StrategyCalculator.get_buy_bo_primary(
-                gann_levels, fund, risk_percent, pair=self.pair
+        high_setup = self._build_high_setup_for_day(day_df, fund, risk_percent)
+        low_setup = self._build_low_setup_for_day(day_df, fund, risk_percent)
+
+        buy_setup = low_setup
+        sell_setup = high_setup
+
+        reg = self._load_live_registry()
+        day_str = str(day)
+
+        buy_completed = False
+        sell_completed = False
+
+        for _, row in reg.items():
+            row_pair = str(row.get("pair", "")).strip()
+            row_day = str(row.get("day", "")).strip()
+            row_side = str(row.get("side", "")).strip().upper()
+            row_completed = bool(row.get("completed", False))
+            row_status = str(row.get("registry_status", "")).strip().upper()
+
+            if row_pair != pair or row_day != day_str:
+                continue
+
+            if row_side == "B" and (row_completed or row_status == "COMPLETED"):
+                buy_completed = True
+
+            if row_side == "S" and (row_completed or row_status == "COMPLETED"):
+                sell_completed = True
+
+        if buy_completed:
+            print(
+                f"  -> {pair} {day} BUY already completed, suppress BUY export")
+            buy_setup = None
+
+        if sell_completed:
+            print(
+                f"  -> {pair} {day} SELL already completed, suppress SELL export")
+            sell_setup = None
+
+        buy_payload = None
+        sell_payload = None
+
+        if buy_setup:
+            print(f"[GEN DBG] {pair} BUY setup = {buy_setup}")
+            buy_payload = self._write_fresh_signal_after_strict_delete(
+                pair=pair,
+                day=day,
+                signal_file=buy_file,
+                setup=buy_setup,
+                existing=existing_buy,
+                existing_status=existing_buy_status,
+                max_spread_points=max_spread_points,
+                max_slippage_points=max_slippage_points,
+                reason="CANCELLEDNEWHHLL",
             )
-            primary["side"] = "B"
+            print(f"[GEN DBG] {pair} BUY payload returned = {buy_payload}")
         else:
-            primary = StrategyCalculator.get_sell_bo_primary(
-                gann_levels, fund, risk_percent, pair=self.pair
+            print(f"  -> {pair} BUY: no setup")
+            if existing_buy_status not in TERMINAL_FILLED_STATUSES:
+                self._cancel_existing_signal_strict(
+                    pair=pair,
+                    day=day,
+                    signal_file=buy_file,
+                    existing=existing_buy,
+                    max_spread_points=max_spread_points,
+                    max_slippage_points=max_slippage_points,
+                    reason="CANCELLEDNEWHHLL",
+                )
+
+        if sell_setup:
+            print(f"[GEN DBG] {pair} SELL setup = {sell_setup}")
+            sell_payload = self._write_fresh_signal_after_strict_delete(
+                pair=pair,
+                day=day,
+                signal_file=sell_file,
+                setup=sell_setup,
+                existing=existing_sell,
+                existing_status=existing_sell_status,
+                max_spread_points=max_spread_points,
+                max_slippage_points=max_slippage_points,
+                reason="CANCELLEDNEWHHLL",
             )
-            primary["side"] = "S"
+            print(f"[GEN DBG] {pair} SELL payload returned = {sell_payload}")
+        else:
+            print(f"  -> {pair} SELL: no setup")
+            if existing_sell_status not in TERMINAL_FILLED_STATUSES:
+                self._cancel_existing_signal_strict(
+                    pair=pair,
+                    day=day,
+                    signal_file=sell_file,
+                    existing=existing_sell,
+                    max_spread_points=max_spread_points,
+                    max_slippage_points=max_slippage_points,
+                    reason="CANCELLEDNEWHHLL",
+                )
 
-        print(
-            f"  -> SIGNAL {primary['side']} Entry={primary['entry']:.5f}, "
-            f"SL={primary['sl']:.5f}, TP={primary['tp']:.5f}, Lot={primary['lot_size']:.2f}"
-        )
-
-        return {
-            "day": day,
-            "side": primary["side"],
-            "entry": primary["entry"],
-            "sl": primary["sl"],
-            "tp": primary["tp"],
-            "lot": primary["lot_size"],
-        }
+        return {"buy": buy_payload, "sell": sell_payload}
 
     def export_to_excel(self, output_path: str) -> None:
         folder = "backtests"
@@ -1680,21 +2903,26 @@ class BacktestEngine1HORB:
 
         # Result counts
         wins = sum(1 for t in self.trades if t["result"] == "tp")
+        sl_lock10 = sum(1 for t in self.trades if t["result"] == "sl_lock10")
         losses = sum(1 for t in self.trades if t["result"] == "sl")
         expired = sum(
-            1 for t in self.trades if t["result"] == "order_expired_1930")
-        others = total_trades - (wins + losses + expired)
+            1 for t in self.trades
+            if str(t.get("result", "")).lower() == RESULT_ORDER_EXPIRED
+        )
+        others = total_trades - (wins + sl_lock10 + losses + expired)
 
         summary = {
             "Metric": [
                 "Initial Fund",
                 "Final Fund",
+                "Final Fund (words)",
                 "Net PNL",
                 "Total Records",
                 "Win Rate (TP only)",
                 "Max Drawdown",
                 "Total Trades",
                 "Wins (TP)",
+                "SL Lock10 Hits",
                 "Losses (SL)",
                 "Expired Orders",
                 "Other Results",
@@ -1702,12 +2930,14 @@ class BacktestEngine1HORB:
             "Value": [
                 self.initial_fund,
                 self.current_fund,
+                self._human_amount(self.current_fund),
                 net_pnl,
                 total_trades,
                 f"{self.win_rate:.2f}%" if total_trades > 0 else "N/A",
                 self.max_drawdown,
                 total_trades,
                 wins,
+                sl_lock10,
                 losses,
                 expired,
                 others,
@@ -1717,8 +2947,103 @@ class BacktestEngine1HORB:
         with pd.ExcelWriter(full_path, engine="openpyxl") as writer:
             if self.trades:
                 trades_df = pd.DataFrame(self.trades)
+
+                # Ensure columns exist for backward compatibility
+                if "entry_mode" not in trades_df.columns:
+                    trades_df["entry_mode"] = ""
+
+                if "sl_mode" not in trades_df.columns:
+                    trades_df["sl_mode"] = "NORMAL"
+
+                # Entry From column from entry_mode
+                trades_df["Entry From"] = trades_df["entry_mode"].apply(
+                    lambda x: "T1" if isinstance(x, str) and x.endswith("_T1")
+                    else ("AT" if isinstance(x, str) and x.endswith("_AT") else "")
+                )
+
+                # Put "Entry From" right after entry_price
+                if "entry_price" in trades_df.columns:
+                    insert_pos = trades_df.columns.get_loc("entry_price") + 1
+                    col = trades_df.pop("Entry From")
+                    trades_df.insert(insert_pos, "Entry From", col)
+
+                # Optional: make sl_mode column display-friendly
+                trades_df["SL Mode"] = trades_df["sl_mode"].apply(
+                    lambda x: "SL_LOCK10" if x == "LOCK10_TP80" else "NORMAL"
+                )
+
+                # Optional column ordering for readability
+                preferred_order = [
+                    "date",
+                    "pair",
+                    "side",
+                    "entry_time",
+                    "entry_price",
+                    "Entry From",
+                    "sl",
+                    "tp",
+                    "exit_time",
+                    "exit_price",
+                    "result",
+                    "SL Mode",
+                    "pnl_pips",
+                    "pnl_amount",
+                    "fund_after",
+                    "max_adverse_pips",
+                    "max_adverse_amount",
+                    "balance_before_trade",
+                    "min_available_balance_during_trade",
+                    "entry_mode",
+                    "sl_mode",
+                ]
+
+                existing_cols = [
+                    c for c in preferred_order if c in trades_df.columns]
+                remaining_cols = [
+                    c for c in trades_df.columns if c not in existing_cols]
+                trades_df = trades_df[existing_cols + remaining_cols]
+
                 trades_df.to_excel(writer, sheet_name="Trades", index=False)
+
             summary_df = pd.DataFrame(summary)
             summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
+            if hasattr(self, "daily_briefings") and self.daily_briefings:
+                daily_df = pd.DataFrame(self.daily_briefings)
+
+                expected_cols = [
+                    "date",
+                    "open_balance",
+                    "risk_percent",
+                    "no_trades",
+                    "tp_hits",
+                    "max_lot",
+                    "profit",
+                    "final_balance",
+                ]
+
+                for col in expected_cols:
+                    if col not in daily_df.columns:
+                        if col == "max_lot":
+                            daily_df[col] = 0.0
+                        else:
+                            daily_df[col] = None
+
+                daily_df = daily_df[expected_cols]
+
+                daily_df.columns = [
+                    "Date",
+                    "Open Balance",
+                    "Risk %",
+                    "No Trades",
+                    "TP Hits",
+                    "Max Lot",
+                    "Profit",
+                    "Final Balance",
+                ]
+
+                daily_df.to_excel(
+                    writer, sheet_name="Day Wise Briefing", index=False
+                )
 
         print(f"\nBacktest results exported to: {full_path}")

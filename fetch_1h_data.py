@@ -5,7 +5,7 @@ import pandas as pd
 from datetime import datetime
 
 PAIR = "EURUSD"
-SYMBOL = "EURUSD.raw"   # ya jo bhi broker ka exact symbol hai
+SYMBOL = "EURUSD.ecn"   # ya jo bhi broker ka exact symbol hai
 CSV_OUT = "eurusd_1h_backtest.csv"
 
 if not mt5.initialize():

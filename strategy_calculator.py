@@ -1,10 +1,21 @@
-import math
 from typing import Dict
 
 
 class StrategyCalculator:
     """
-    Dual-side BO setups: Primary T1.5 (÷4), OPP T1 (÷5)
+    Gann strategy calculator with flexible entry/target selection.
+
+    STOPLOSS:
+      - Entry BUY_AT   -> SL = SELL_AT
+      - Entry BUY_T1   -> SL = BUY_AT
+      - Entry SELL_AT  -> SL = BUY_AT
+      - Entry SELL_T1  -> SL = SELL_AT
+
+    DEFAULT TARGET:
+      - Entry BUY_AT   -> Target = BUY_T1
+      - Entry BUY_T1   -> Target = BUY_T15
+      - Entry SELL_AT  -> Target = SELL_T1
+      - Entry SELL_T1  -> Target = SELL_T15
     """
 
     @staticmethod
@@ -19,178 +30,157 @@ class StrategyCalculator:
         return 10.0
 
     @staticmethod
-    def roundoff_pips(pips: float) -> int:
-        """Floor: 4.9→4, 4.1→4"""
-        return int(math.floor(pips))
+    def _pip_multiplier(pair: str) -> float:
+        pair = pair.upper().replace('/', '').replace('_', '')
+        if pair.endswith("JPY"):
+            return 100.0
+        return 10000.0
 
     @staticmethod
-    def calculate_t15(t1: float, t2: float) -> float:
-        return (t1 + t2) / 2
+    def _calc_sl_pips(entry: float, sl: float, pair: str) -> float:
+        mult = StrategyCalculator._pip_multiplier(pair)
+        return abs(entry - sl) * mult
 
     @staticmethod
-    def calculate_sl_sizing_t15(t15: float, t1: float) -> int:
-        """Primary BO: |T1.5-T1| / 5 → pips"""
-        diff = abs(t15 - t1)
-        pips = (diff / 5) / 0.0001
-        return StrategyCalculator.roundoff_pips(pips)
-
-    @staticmethod
-    def calculate_sl_sizing_t1(t1: float, at: float) -> int:
-        """OPP leg: |T1-AT| / 6 → pips"""
-        diff = abs(t1 - at)
-        pips = (diff / 6) / 0.0001
-        return StrategyCalculator.roundoff_pips(pips)
-
-    @staticmethod
-    def calculate_tp_pips(sl_pips: int) -> int:
-        return sl_pips * 2  # 1:2 RR
-
-    @staticmethod
-    def calculate_lot_size(fund: float, risk_percent: float, sl_pips: int,
-                           pair: str, entry: float) -> float:
+    def calculate_lot_size(
+        fund: float,
+        risk_percent: float,
+        sl_pips: float,
+        pair: str,
+        entry: float,
+    ) -> float:
         if fund <= 0 or sl_pips <= 0:
             return 0.01
-        risk_amount = fund * (risk_percent / 100)
+
+        risk_amount = fund * (float(risk_percent) / 100.0)
         pip_value = StrategyCalculator.get_pip_value_per_lot(pair, entry)
-        lot = risk_amount / (sl_pips * pip_value)
-        # No upper cap
-        return max(0.01, round(lot, 2))
+        per_lot_risk = sl_pips * pip_value
 
-    # ========== BUY BO ==========
+        if per_lot_risk <= 0:
+            return 0.01
+
+        lot = risk_amount / per_lot_risk
+        lot = max(0.01, round(lot, 2))
+        return lot
 
     @staticmethod
-    def get_buy_bo_primary(gann_levels: Dict, fund: float, risk_percent: float,
-                           pair: str) -> Dict:
-        """BUY BO Primary: T1.5 ÷4"""
-        buy_t1 = gann_levels['buy_targets'][0]
-        buy_t2 = gann_levels['buy_targets'][1]
-        sell_t1 = gann_levels['sell_targets'][0]  # SL
+    def _extract_levels(gann: Dict) -> Dict:
+        buy_t1 = float(gann["buy_t1"]) if "buy_t1" in gann else float(
+            gann["buy_targets"][0])
+        buy_t2 = float(gann["buy_t2"]) if "buy_t2" in gann else float(
+            gann["buy_targets"][1])
 
-        entry = StrategyCalculator.calculate_t15(buy_t1, buy_t2)
-        sl_pips = StrategyCalculator.calculate_sl_sizing_t15(entry, buy_t1)
-        tp_pips = StrategyCalculator.calculate_tp_pips(sl_pips)
+        sell_t1 = float(gann["sell_t1"]) if "sell_t1" in gann else float(
+            gann["sell_targets"][0])
+        sell_t2 = float(gann["sell_t2"]) if "sell_t2" in gann else float(
+            gann["sell_targets"][1])
 
-        sl_level = sell_t1  # Gann SL
-        tp_level = entry + tp_pips * 0.0001
+        buy_at = float(gann["buy_at"])
+        sell_at = float(gann["sell_at"])
 
-        lot = StrategyCalculator.calculate_lot_size(
-            fund, risk_percent, sl_pips, pair, entry)
+        buy_t05 = round((buy_at + buy_t1) / 2.0, 5)
+        sell_t05 = round((sell_at + sell_t1) / 2.0, 5)
+
+        buy_t15 = round((buy_t1 + buy_t2) / 2.0, 5)
+        sell_t15 = round((sell_t1 + sell_t2) / 2.0, 5)
 
         return {
-            'side': 'BUY',
-            'entry': round(entry, 5),
-            'sl': round(sl_level, 5),
-            'tp': round(tp_level, 5),
-            'sl_pips': sl_pips,
-            'tp_pips': tp_pips,
-            'lot_size': lot,
+            "buy_at": buy_at,
+            "buy_t05": buy_t05,
+            "buy_t1": buy_t1,
+            "buy_t2": buy_t2,
+            "buy_t15": buy_t15,
+            "sell_at": sell_at,
+            "sell_t05": sell_t05,
+            "sell_t1": sell_t1,
+            "sell_t2": sell_t2,
+            "sell_t15": sell_t15,
         }
 
     @staticmethod
-    def get_buy_bo_opp_sell(gann_levels: Dict, fund: float, risk_percent: float,
-                            pair: str) -> Dict:
-        """BUY BO OPP SELL: T1 ÷5"""
-        sell_t1 = gann_levels['sell_targets'][0]
-        buy_t1 = gann_levels['buy_targets'][0]  # SL
-
-        entry = sell_t1
-        sl_pips = StrategyCalculator.calculate_sl_sizing_t1(
-            sell_t1, gann_levels['sell_at'])
-        tp_pips = StrategyCalculator.calculate_tp_pips(sl_pips)
-
-        sl_level = buy_t1  # Gann SL
-        tp_level = entry - tp_pips * 0.0001
-
+    def build_custom_setup(
+        side: str,
+        entry: float,
+        sl: float,
+        tp: float,
+        fund: float,
+        risk_percent: float,
+        pair: str,
+        entry_mode: str,
+        target_mode: str,
+    ) -> Dict:
+        sl_pips = StrategyCalculator._calc_sl_pips(entry, sl, pair)
         lot = StrategyCalculator.calculate_lot_size(
-            fund, risk_percent, sl_pips, pair, entry)
+            fund, risk_percent, sl_pips, pair, entry
+        )
 
         return {
-            'side': 'SELL',
-            'entry': round(entry, 5),
-            'sl': round(sl_level, 5),
-            'tp': round(tp_level, 5),
-            'sl_pips': sl_pips,
-            'tp_pips': tp_pips,
-            'lot_size': lot,
-        }
-
-    # ========== SELL BO ==========
-
-    @staticmethod
-    def get_sell_bo_primary(gann_levels: Dict, fund: float, risk_percent: float,
-                            pair: str) -> Dict:
-        """SELL BO Primary: T1.5 ÷4"""
-        sell_t1 = gann_levels['sell_targets'][0]
-        sell_t2 = gann_levels['sell_targets'][1]
-        buy_t1 = gann_levels['buy_targets'][0]  # SL
-
-        entry = StrategyCalculator.calculate_t15(sell_t1, sell_t2)
-        sl_pips = StrategyCalculator.calculate_sl_sizing_t15(entry, sell_t1)
-        tp_pips = StrategyCalculator.calculate_tp_pips(sl_pips)
-
-        sl_level = buy_t1  # Gann SL
-        tp_level = entry - tp_pips * 0.0001
-
-        lot = StrategyCalculator.calculate_lot_size(
-            fund, risk_percent, sl_pips, pair, entry)
-
-        return {
-            'side': 'SELL',
-            'entry': round(entry, 5),
-            'sl': round(sl_level, 5),
-            'tp': round(tp_level, 5),
-            'sl_pips': sl_pips,
-            'tp_pips': tp_pips,
-            'lot_size': lot,
+            "side": side,
+            "entry": round(float(entry), 5),
+            "sl": round(float(sl), 5),
+            "tp": round(float(tp), 5),
+            "sl_pips": round(float(sl_pips), 1),
+            "lot_size": lot,
+            "entry_mode": entry_mode,
+            "target_mode": target_mode,
         }
 
     @staticmethod
-    def get_sell_bo_opp_buy(gann_levels: Dict, fund: float, risk_percent: float,
-                            pair: str) -> Dict:
-        """SELL BO OPP BUY: T1 ÷5"""
-        buy_t1 = gann_levels['buy_targets'][0]
-        sell_t1 = gann_levels['sell_targets'][0]  # SL
+    def build_buy_from_buyat(gann: Dict, fund: float, risk_percent: float, pair: str) -> Dict:
+        lv = StrategyCalculator._extract_levels(gann)
+        return StrategyCalculator.build_custom_setup(
+            side="B",
+            entry=lv["buy_at"],
+            sl=lv["sell_at"],
+            tp=lv["buy_t1"],
+            fund=fund,
+            risk_percent=risk_percent,
+            pair=pair,
+            entry_mode="BUY_AT",
+            target_mode="T1",
+        )
 
-        entry = buy_t1
-        sl_pips = StrategyCalculator.calculate_sl_sizing_t1(
-            buy_t1, gann_levels['buy_at'])
-        tp_pips = StrategyCalculator.calculate_tp_pips(sl_pips)
+    @staticmethod
+    def build_buy_from_buy_t1(gann: Dict, fund: float, risk_percent: float, pair: str) -> Dict:
+        lv = StrategyCalculator._extract_levels(gann)
+        return StrategyCalculator.build_custom_setup(
+            side="B",
+            entry=lv["buy_t1"],
+            sl=lv["buy_at"],
+            tp=lv["buy_t15"],
+            fund=fund,
+            risk_percent=risk_percent,
+            pair=pair,
+            entry_mode="BUY_T1",
+            target_mode="T15",
+        )
 
-        sl_level = sell_t1  # Gann SL
-        tp_level = entry + tp_pips * 0.0001
+    @staticmethod
+    def build_sell_from_sellat(gann: Dict, fund: float, risk_percent: float, pair: str) -> Dict:
+        lv = StrategyCalculator._extract_levels(gann)
+        return StrategyCalculator.build_custom_setup(
+            side="S",
+            entry=lv["sell_at"],
+            sl=lv["buy_at"],
+            tp=lv["sell_t1"],
+            fund=fund,
+            risk_percent=risk_percent,
+            pair=pair,
+            entry_mode="SELL_AT",
+            target_mode="T1",
+        )
 
-        lot = StrategyCalculator.calculate_lot_size(
-            fund, risk_percent, sl_pips, pair, entry)
-
-        return {
-            'side': 'BUY',
-            'entry': round(entry, 5),
-            'sl': round(sl_level, 5),
-            'tp': round(tp_level, 5),
-            'sl_pips': sl_pips,
-            'tp_pips': tp_pips,
-            'lot_size': lot,
-        }
-
-
-# Test with your gann_levels
-if __name__ == "__main__":
-    gann_levels = {
-        'buy_at': 1.7045,
-        'buy_targets': [1.7077, 1.7117],
-        'sell_at': 1.7004,
-        'sell_targets': [1.6973, 1.6933],
-    }
-    fund, risk, pair = 100, 8, 'EURUSD'
-
-    print("=== BUY BO ===")
-    print("PRIMARY BUY:", StrategyCalculator.get_buy_bo_primary(
-        gann_levels, fund, risk, pair))
-    print("OPP SELL:  ", StrategyCalculator.get_buy_bo_opp_sell(
-        gann_levels, fund, risk, pair))
-
-    print("\n=== SELL BO ===")
-    print("PRIMARY SELL:", StrategyCalculator.get_sell_bo_primary(
-        gann_levels, fund, risk, pair))
-    print("OPP BUY:    ", StrategyCalculator.get_sell_bo_opp_buy(
-        gann_levels, fund, risk, pair))
+    @staticmethod
+    def build_sell_from_sell_t1(gann: Dict, fund: float, risk_percent: float, pair: str) -> Dict:
+        lv = StrategyCalculator._extract_levels(gann)
+        return StrategyCalculator.build_custom_setup(
+            side="S",
+            entry=lv["sell_t1"],
+            sl=lv["sell_at"],
+            tp=lv["sell_t15"],
+            fund=fund,
+            risk_percent=risk_percent,
+            pair=pair,
+            entry_mode="SELL_T1",
+            target_mode="T15",
+        )

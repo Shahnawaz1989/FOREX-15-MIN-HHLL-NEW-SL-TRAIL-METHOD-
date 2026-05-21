@@ -6,6 +6,19 @@ def init_mt5():
     if not mt5.initialize():
         raise RuntimeError("MT5 init failed")
 
+    info = mt5.terminal_info()
+    acc = mt5.account_info()
+
+    print("MT5 TERMINAL INFO:")
+    print("  path   :", info.path if info else None)
+    print("ACCOUNT INFO:")
+    if acc is not None:
+        print("  login  :", acc.login)
+        print("  server :", acc.server)
+    else:
+        print("  login  : None")
+        print("  server : None")
+
 
 def shutdown_mt5():
     mt5.shutdown()
