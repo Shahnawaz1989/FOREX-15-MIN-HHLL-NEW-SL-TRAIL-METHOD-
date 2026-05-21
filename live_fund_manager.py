@@ -6,24 +6,22 @@ def get_live_usable_fund(
     live_strategy_start_fund=None,
 ):
     """
-    Live sizing helper
+    Live sizing helper.
 
     If use_live_equity_sizing == False:
         return currentfund
 
     Else:
         usable_fund = live_equity - reserved_fund
-        reserved_fund = max(0, source_fund - strategy_start_fund)
 
-    Example:
-        source_fund = 65
-        strategy_start_fund = 30
-        reserved = 35
-
-        equity = 100
-        usable = 100 - 40 = 65
+    reserved_fund logic:
+        source_fund = live_source_fund if provided else initialfund
+        start_fund = live_strategy_start_fund if provided else initialfund
+        reserved_fund = max(0, source_fund - start_fund)
     """
     if not use_live_equity_sizing:
+        print(
+            f"  -> Live sizing disabled, using currentfund={float(currentfund):.2f}")
         return float(currentfund)
 
     try:
@@ -36,10 +34,16 @@ def get_live_usable_fund(
 
         live_equity = float(info.equity)
 
-        source_fund = float(
-            live_source_fund) if live_source_fund is not None else float(initialfund)
-        start_fund = float(
-            live_strategy_start_fund) if live_strategy_start_fund is not None else float(initialfund)
+        source_fund = (
+            float(live_source_fund)
+            if live_source_fund is not None
+            else float(initialfund)
+        )
+        start_fund = (
+            float(live_strategy_start_fund)
+            if live_strategy_start_fund is not None
+            else float(initialfund)
+        )
 
         reserved_fund = max(0.0, source_fund - start_fund)
         usable_fund = max(0.0, live_equity - reserved_fund)

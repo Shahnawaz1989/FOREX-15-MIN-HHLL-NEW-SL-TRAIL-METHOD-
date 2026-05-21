@@ -27,7 +27,37 @@ from backtest_orb_trade_simulator import (
     compute_m1_mae_after_entry,
     simulate_trade,
 )
+from live_registry_manager import (
+    ensure_registry_file,
+    load_live_registry,
+    save_live_registry,
+    fmt_live_ts,
+    live_signal_expiry_server,
+    make_signal_id_from_setup,
+    mark_signal_completed_in_registry,
+    mark_signal_non_completed_in_registry,
+    is_signal_completed_in_registry,
+    is_same_completed_trade_prices,
+    has_any_completed_trade_for_pair_day,
+    has_active_registry_signal_for_pair_day_side,
+    is_setup_in_hhll_disable_window,
+    parse_registry_ts,
+    get_signal_expiry_from_row,
+    scan_signal_outcome_from_df,
+    reconcile_open_registry_signals_with_market_data,
+)
 
+from live_signal_file_manager import (
+    ACTIVE_FILE_STATUSES,
+    is_same_live_payload,
+    build_live_cancel_payload,
+    build_live_place_payload,
+    live_payload_to_line,
+    read_existing_live_signal,
+    write_live_signal_file,
+    cancel_existing_signal_strict,
+    write_fresh_signal_after_strict_delete,
+)
 # Simple ANSI colors for terminal
 RESET = "\033[0m"
 GREEN = "\033[92m"
@@ -45,7 +75,6 @@ TERMINAL_DEAD_STATUSES = {
     "ORDEREXPIRED1930",
 }
 
-ACTIVE_FILE_STATUSES = {"NEW", "PLACED"}
 
 REGISTRY_DIR = "live_registry"
 REGISTRY_FILE = os.path.join(REGISTRY_DIR, "hl_live_registry.json")
@@ -669,77 +698,48 @@ class BacktestEngine1HORB:
             return f"{n:.2f}"
 
     def _ensure_registry_file(self):
-        os.makedirs(REGISTRY_DIR, exist_ok=True)
-        if not os.path.exists(REGISTRY_FILE):
-            with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
-                json.dump({}, f, indent=2)
+        return ensure_registry_file()
 
     def _load_live_registry(self) -> Dict:
-        self._ensure_registry_file()
-        try:
-            with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception as e:
-            print(f"  -> Registry load failed: {e}")
-            return {}
+        return load_live_registry()
 
     def _save_live_registry(self, data: Dict):
-        self._ensure_registry_file()
-        with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
+        return save_live_registry(data)
+
+    def _get_live_fund_for_sizing(self) -> float:
+        try:
+            from live_fund_manager import get_live_usable_fund
+
+            return float(get_live_usable_fund(
+                currentfund=self.current_fund,
+                initialfund=self.initial_fund,
+                use_live_equity_sizing=getattr(
+                    self, "use_live_equity_sizing", False),
+                live_source_fund=getattr(self, "live_source_fund", None),
+                live_strategy_start_fund=getattr(
+                    self, "live_strategy_start_fund", None),
+            ))
+        except Exception as e:
+            print(f"  -> _get_live_fund_for_sizing fallback current fund: {e}")
+            return float(self.current_fund)
 
     def _fmt_live_ts(self, x):
-        if x is None:
-            return ""
-        try:
-            return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return str(x)
+        return fmt_live_ts(x)
 
     def _live_signal_expiry_server(self, day):
-        return datetime.combine(day, time(23, 50))
+        return live_signal_expiry_server(day)
 
     def _make_signal_id_from_setup(self, pair: str, day, setup: dict) -> str:
-        side = str(setup.get("side", "")).strip().upper()
-        trigger = self._fmt_live_ts(setup.get("trigger_time")).replace(
-            " ", "_").replace(":", "-")
-        entry = round(float(setup.get("entry", 0.0)), 5)
-        sl = round(float(setup.get("sl", 0.0)), 5)
-        tp = round(float(setup.get("tp", 0.0)), 5)
-        return f"{pair}_{day}_{side}_{trigger}_{entry:.5f}_{sl:.5f}_{tp:.5f}"
+        return make_signal_id_from_setup(pair, day, setup)
 
     def _mark_signal_completed_in_registry(self, signal_id: str, trade: Dict):
-        reg = self._load_live_registry()
-        if signal_id not in reg:
-            reg[signal_id] = {"signal_id": signal_id}
-
-        result = str(trade.get("result", "")).lower()
-        reg[signal_id]["entry_hit"] = True
-        reg[signal_id]["exit_result"] = result
-        reg[signal_id]["entry_time"] = str(trade.get("entry_time", ""))
-        reg[signal_id]["exit_time"] = str(trade.get("exit_time", ""))
-        reg[signal_id]["registry_status"] = "COMPLETED"
-        reg[signal_id]["completed"] = True
-        reg[signal_id]["last_updated"] = datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S")
-        self._save_live_registry(reg)
+        return mark_signal_completed_in_registry(signal_id, trade)
 
     def _mark_signal_non_completed_in_registry(self, signal_id: str, status: str):
-        reg = self._load_live_registry()
-        if signal_id not in reg:
-            reg[signal_id] = {"signal_id": signal_id}
-
-        reg[signal_id]["registry_status"] = str(status).upper()
-        reg[signal_id]["completed"] = False
-        reg[signal_id]["last_updated"] = datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S")
-        self._save_live_registry(reg)
+        return mark_signal_non_completed_in_registry(signal_id, status)
 
     def _is_signal_completed_in_registry(self, signal_id: str) -> bool:
-        reg = self._load_live_registry()
-        row = reg.get(signal_id, {})
-        return bool(row.get("completed", False))
+        return is_signal_completed_in_registry(signal_id)
 
     def _is_same_completed_trade_prices(
         self,
@@ -751,303 +751,44 @@ class BacktestEngine1HORB:
         tp: float,
         price_tol: float = 0.00005,
     ) -> bool:
-        reg = self._load_live_registry()
-        day_str = str(day)
-
-        def _as_float(x, default=0.0):
-            try:
-                return float(x)
-            except Exception:
-                return default
-
-        def _same_price(a, b):
-            return abs(_as_float(a) - _as_float(b)) <= price_tol
-
-        for _, row in reg.items():
-            row_pair = str(row.get("pair", "")).strip()
-            row_day = str(row.get("day", "")).strip()
-            row_side = str(row.get("side", "")).strip().upper()
-            row_completed = bool(row.get("completed", False))
-            row_status = str(row.get("registry_status", "")).strip().upper()
-
-            if row_pair != pair:
-                continue
-            if row_day != day_str:
-                continue
-            if row_side != side.upper():
-                continue
-            if not (row_completed or row_status == "COMPLETED"):
-                continue
-
-            row_entry = row.get("entry", 0.0)
-            row_sl = row.get("sl", 0.0)
-            row_tp = row.get("tp", 0.0)
-
-            if _same_price(row_entry, entry) and _same_price(row_sl, sl) and _same_price(row_tp, tp):
-                return True
-
-        return False
+        return is_same_completed_trade_prices(
+            pair=pair,
+            day=day,
+            side=side,
+            entry=entry,
+            sl=sl,
+            tp=tp,
+            price_tol=price_tol,
+        )
 
     def _has_any_completed_trade_for_pair_day(self, pair: str, day) -> bool:
-        reg = self._load_live_registry()
-        day_str = str(day)
-
-        for _, row in reg.items():
-            row_pair = str(row.get("pair", "")).strip()
-            row_day = str(row.get("day", "")).strip()
-            row_completed = bool(row.get("completed", False))
-            row_status = str(row.get("registry_status", "")).strip().upper()
-
-            if row_pair != pair:
-                continue
-            if row_day != day_str:
-                continue
-
-            if row_completed or row_status == REGISTRY_STATUS_COMPLETED:
-                return True
-
-        return False
+        return has_any_completed_trade_for_pair_day(pair, day)
 
     def _has_active_registry_signal_for_pair_day_side(self, pair: str, day, side: str) -> bool:
-        reg = self._load_live_registry()
-        day_str = str(day)
-        side = str(side).strip().upper()
-
-        active_statuses = {
-            "GENERATED",
-            "NEW",
-            "PLACED",
-            "ENTRY_HIT",
-            "BE_APPLIED",
-            "LOCK10_APPLIED",
-            "ACTIVE",
-        }
-
-        for _, row in reg.items():
-            row_pair = str(row.get("pair", "")).strip()
-            row_day = str(row.get("day", "")).strip()
-            row_side = str(row.get("side", "")).strip().upper()
-            row_completed = bool(row.get("completed", False))
-            row_status = str(row.get("registry_status", "")).strip().upper()
-
-            if row_pair != pair:
-                continue
-            if row_day != day_str:
-                continue
-            if row_side != side:
-                continue
-            if row_completed:
-                continue
-
-            if row_status in active_statuses:
-                return True
-
-        return False
+        return has_active_registry_signal_for_pair_day_side(pair, day, side)
 
     def _is_setup_in_hhll_disable_window(self, setup: dict) -> bool:
-        if not setup:
-            return False
-
-        trigger_time = setup.get("trigger_time")
-        if trigger_time is None:
-            return False
-
-        try:
-            trigger_time = pd.to_datetime(trigger_time)
-        except Exception:
-            return False
-
-        t = trigger_time.time()
-        return self.hhll_disable_start_server <= t < self.hhll_disable_end_server
+        return is_setup_in_hhll_disable_window(
+            setup=setup,
+            disable_start_server=self.hhll_disable_start_server,
+            disable_end_server=self.hhll_disable_end_server,
+        )
 
     def _parse_registry_ts(self, x):
-        if x is None or str(x).strip() == "":
-            return None
-        try:
-            return pd.to_datetime(x)
-        except Exception:
-            return None
+        return parse_registry_ts(x)
 
     def _get_signal_expiry_from_row(self, row: Dict):
-        day_str = str(row.get("day", "")).strip()
-        if not day_str:
-            return None
-        try:
-            day_dt = pd.to_datetime(day_str).date()
-            return self._live_signal_expiry_server(day_dt)
-        except Exception:
-            return None
+        return get_signal_expiry_from_row(row)
 
     def _scan_signal_outcome_from_df(self, df: pd.DataFrame, row: Dict):
-        if df is None or df.empty:
-            return None
-
-        df = df.copy()
-        df["time"] = pd.to_datetime(df["time"])
-        df = df.sort_values("time").reset_index(drop=True)
-
-        side = str(row.get("side", "")).upper().strip()
-        entry = float(row.get("entry", 0.0))
-        sl = float(row.get("sl", 0.0))
-        tp = float(row.get("tp", 0.0))
-        trigger_time = self._parse_registry_ts(row.get("trigger_time"))
-
-        if trigger_time is None:
-            return None
-
-        expiry_time = self._get_signal_expiry_from_row(row)
-        if expiry_time is None:
-            expiry_time = df["time"].max()
-
-        scan_df = df[df["time"] >= trigger_time].copy()
-        if scan_df.empty:
-            return None
-
-        entry_hit = False
-        entry_time = None
-
-        for _, candle in scan_df.iterrows():
-            t = candle["time"]
-            high = float(candle["high"])
-            low = float(candle["low"])
-
-            if not entry_hit:
-                if t > expiry_time:
-                    return {
-                        "kind": "noncompleted",
-                        "status": REGISTRY_STATUS_ORDER_EXPIRED,
-                    }
-
-                if side == "B" and high >= entry:
-                    entry_hit = True
-                    entry_time = t
-                elif side == "S" and low <= entry:
-                    entry_hit = True
-                    entry_time = t
-                else:
-                    continue
-
-            if side == "B":
-                tp_hit = high >= tp
-                sl_hit = low <= sl
-            else:
-                tp_hit = low <= tp
-                sl_hit = high >= sl
-
-            if tp_hit and sl_hit:
-                resolved = self._resolve_same_candle_exit_with_m1(
-                    side=side,
-                    entry_time=entry_time,
-                    actual_entry=entry,
-                    sl=sl,
-                    tp=tp,
-                )
-
-                if resolved is not None:
-                    resolved_result = str(resolved.get("result", "")).lower()
-                    resolved_exit_time = resolved.get("exit_time")
-
-                    if resolved_result == RESULT_TP:
-                        return {
-                            "kind": "completed",
-                            "trade": {
-                                "result": RESULT_TP,
-                                "entry_time": entry_time,
-                                "exit_time": resolved_exit_time,
-                            },
-                        }
-
-                    if resolved_result == RESULT_SL:
-                        return {
-                            "kind": "completed",
-                            "trade": {
-                                "result": RESULT_SL,
-                                "entry_time": entry_time,
-                                "exit_time": resolved_exit_time,
-                            },
-                        }
-
-                    if resolved_result == RESULT_SESSION_EXIT:
-                        return {
-                            "kind": "noncompleted",
-                            "status": REGISTRY_STATUS_ORDER_EXPIRED
-                            if t >= expiry_time
-                            else REGISTRY_STATUS_ENTRY_HIT,
-                        }
-
-            if tp_hit:
-                return {
-                    "kind": "completed",
-                    "trade": {
-                        "result": RESULT_TP,
-                        "entry_time": entry_time,
-                        "exit_time": t,
-                    },
-                }
-
-            if sl_hit:
-                return {
-                    "kind": "completed",
-                    "trade": {
-                        "result": RESULT_SL,
-                        "entry_time": entry_time,
-                        "exit_time": t,
-                    },
-                }
-
-        if not entry_hit and df["time"].max() >= expiry_time:
-            return {
-                "kind": "noncompleted",
-                "status": REGISTRY_STATUS_ORDER_EXPIRED,
-            }
-
-        if entry_hit:
-            reg = self._load_live_registry()
-            signal_id = str(row.get("signal_id", "")).strip()
-            if signal_id in reg:
-                reg[signal_id]["entry_hit"] = True
-                reg[signal_id]["entry_time"] = str(entry_time)
-                reg[signal_id]["registry_status"] = REGISTRY_STATUS_ENTRY_HIT
-                reg[signal_id]["last_updated"] = datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S")
-                self._save_live_registry(reg)
-
-        return None
+        return scan_signal_outcome_from_df(df, row)
 
     def _reconcile_open_registry_signals_with_market_data(self, pair: str, df: pd.DataFrame):
-        reg = self._load_live_registry()
-        if not reg:
-            return
-
-        for signal_id, row in list(reg.items()):
-            row_pair = str(row.get("pair", "")).strip()
-            if row_pair != pair:
-                continue
-
-            status = str(row.get("registry_status", "GENERATED")
-                         ).upper().strip()
-            completed = bool(row.get("completed", False))
-
-            if completed:
-                continue
-
-            if status in ("COMPLETED", "FAILED", "ORDEREXPIRED1930", "CANCELLEDNEWHHLL", "CANCELLED_NEW_HH_LL"):
-                continue
-
-            outcome = self._scan_signal_outcome_from_df(df=df, row=row)
-            if not outcome:
-                continue
-
-            if outcome["kind"] == "completed":
-                self._mark_signal_completed_in_registry(
-                    signal_id, outcome["trade"])
-                print(
-                    f"  -> Registry completed: {signal_id} -> {outcome['trade']['result']}")
-            elif outcome["kind"] == "noncompleted":
-                self._mark_signal_non_completed_in_registry(
-                    signal_id, outcome["status"])
-                print(
-                    f"  -> Registry non-completed: {signal_id} -> {outcome['status']}")
+        return reconcile_open_registry_signals_with_market_data(
+            engine=self,
+            pair=pair,
+            df=df,
+        )
 
     def _is_same_live_payload(self, existing: Optional[Dict], payload: Dict) -> bool:
         if not existing or not payload:
@@ -1622,7 +1363,6 @@ class BacktestEngine1HORB:
         if "atr" not in df.columns:
             df = self._add_atr_column(df)
 
-        # IMPORTANT: refresh registry against latest market data for this pair
         self._reconcile_open_registry_signals_with_market_data(
             pair=pair, df=df)
 
@@ -1641,9 +1381,8 @@ class BacktestEngine1HORB:
         buy_file = os.path.join(signal_dir, f"live_signal_{pair}_BUY.txt")
         sell_file = os.path.join(signal_dir, f"live_signal_{pair}_SELL.txt")
 
-        old_buy_line, existing_buy = self._read_existing_live_signal(buy_file)
-        old_sell_line, existing_sell = self._read_existing_live_signal(
-            sell_file)
+        _, existing_buy = self._read_existing_live_signal(buy_file)
+        _, existing_sell = self._read_existing_live_signal(sell_file)
 
         def _is_existing_from_old_day(existing_payload, current_day):
             if existing_payload is None:
@@ -1657,13 +1396,11 @@ class BacktestEngine1HORB:
 
             return day_str not in existing_signal_id and day_str not in existing_expiry
 
-        # stale old-day BUY file/payload ignore
         if _is_existing_from_old_day(existing_buy, day):
             print(
                 f"  -> Existing BUY file belongs to old day, treating as stale: {buy_file}")
             existing_buy = None
 
-        # stale old-day SELL file/payload ignore
         if _is_existing_from_old_day(existing_sell, day):
             print(
                 f"  -> Existing SELL file belongs to old day, treating as stale: {sell_file}")
@@ -1701,7 +1438,8 @@ class BacktestEngine1HORB:
 
             return {"buy": None, "sell": None}
 
-        fund = self.current_fund
+        fund = self._get_live_fund_for_sizing()
+        print(f"  -> Live sizing fund selected = {fund:.2f}")
         risk_percent = self.base_risk_percent
 
         high_setup = self._build_high_setup_for_day(day_df, fund, risk_percent)
@@ -1709,6 +1447,50 @@ class BacktestEngine1HORB:
 
         buy_setup = low_setup
         sell_setup = high_setup
+
+        if buy_setup and self._is_setup_in_hhll_disable_window(buy_setup):
+            print(
+                f"  -> {pair} BUY suppressed: setup trigger in HH/LL disable window")
+            buy_setup = None
+
+        if sell_setup and self._is_setup_in_hhll_disable_window(sell_setup):
+            print(
+                f"  -> {pair} SELL suppressed: setup trigger in HH/LL disable window")
+            sell_setup = None
+
+        if buy_setup and self._is_same_completed_trade_prices(
+            pair=pair,
+            day=day,
+            side="B",
+            entry=float(buy_setup.get("entry", 0.0)),
+            sl=float(buy_setup.get("sl", 0.0)),
+            tp=float(buy_setup.get("tp", 0.0)),
+        ):
+            print(
+                f"  -> {pair} {day} BUY suppressed: same completed setup already closed")
+            buy_setup = None
+
+        if sell_setup and self._is_same_completed_trade_prices(
+            pair=pair,
+            day=day,
+            side="S",
+            entry=float(sell_setup.get("entry", 0.0)),
+            sl=float(sell_setup.get("sl", 0.0)),
+            tp=float(sell_setup.get("tp", 0.0)),
+        ):
+            print(
+                f"  -> {pair} {day} SELL suppressed: same completed setup already closed")
+            sell_setup = None
+
+        if buy_setup and self._has_active_registry_signal_for_pair_day_side(pair, day, "B"):
+            print(
+                f"  -> {pair} {day} BUY suppressed: active registry signal already exists")
+            buy_setup = None
+
+        if sell_setup and self._has_active_registry_signal_for_pair_day_side(pair, day, "S"):
+            print(
+                f"  -> {pair} {day} SELL suppressed: active registry signal already exists")
+            sell_setup = None
 
         reg = self._load_live_registry()
         day_str = str(day)

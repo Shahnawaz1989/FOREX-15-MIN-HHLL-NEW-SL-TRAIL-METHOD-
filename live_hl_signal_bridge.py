@@ -11,26 +11,6 @@ from live_cleanup import run_startup_cleanup
 
 HEARTBEAT_FILE = r"C:\trading_bot\heartbeats\live_runner_heartbeat.json"
 
-
-def write_heartbeat(stage="alive", extra=None):
-    os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
-
-    payload = {
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "stage": stage,
-        "pid": os.getpid(),
-    }
-
-    if extra and isinstance(extra, dict):
-        payload.update(extra)
-
-    tmp = HEARTBEAT_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, default=str)
-
-    os.replace(tmp, HEARTBEAT_FILE)
-
-
 PAIRS = [
     "AUDCAD.ecn",
     "AUDUSD.ecn",
@@ -63,6 +43,25 @@ SIGNAL_DIR = r"C:\Users\Administrator\AppData\Roaming\MetaQuotes\Terminal\D0E820
 REGISTRY_FILE = r"live_registry/hl_live_registry.json"
 
 
+def write_heartbeat(stage="alive", extra=None):
+    os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
+
+    payload = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "stage": stage,
+        "pid": os.getpid(),
+    }
+
+    if extra and isinstance(extra, dict):
+        payload.update(extra)
+
+    tmp = HEARTBEAT_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+    os.replace(tmp, HEARTBEAT_FILE)
+
+
 def process_pair(engine: BacktestEngine1HORB, pair: str):
     write_heartbeat("processing_pair", {"pair": pair})
 
@@ -83,16 +82,45 @@ def process_pair(engine: BacktestEngine1HORB, pair: str):
         print("  -> Data empty after datetime parsing")
         return
 
+    latest_day = df["datetime"].dt.date.max()
     print(f"  -> {pair} max datetime in 15m df = {df['datetime'].max()}")
     print(df[["datetime", "open", "high", "low", "close"]].tail(5))
 
-    engine.generate_live_dual_signals_for_latest_day(
+    try:
+        reg = engine._load_live_registry()
+        active_rows = []
+        completed_rows = []
+
+        for _, row in reg.items():
+            row_pair = str(row.get("pair", "")).strip()
+            row_day = str(row.get("day", "")).strip()
+            row_status = str(row.get("registry_status", "")).strip().upper()
+            row_completed = bool(row.get("completed", False))
+
+            if row_pair != pair or row_day != str(latest_day):
+                continue
+
+            if row_completed or row_status == "COMPLETED":
+                completed_rows.append(row)
+            else:
+                active_rows.append(row)
+
+        print(
+            f"  -> Registry snapshot for {pair} day={latest_day}: "
+            f"active={len(active_rows)}, completed={len(completed_rows)}"
+        )
+    except Exception as e:
+        print(f"  -> Registry snapshot failed for {pair}: {e}")
+
+    result = engine.generate_live_dual_signals_for_latest_day(
         pair=pair,
         df_15m=df,
         signal_dir=SIGNAL_DIR,
         max_spread_points=MAX_SPREAD_POINTS,
         max_slippage_points=MAX_SLIPPAGE_POINTS,
     )
+
+    print(f"  -> Result for {pair}: {result}")
 
 
 def main():
@@ -110,8 +138,8 @@ def main():
         )
 
         engine.use_live_equity_sizing = True
-        engine.live_source_fund = 70.0
-        engine.live_strategy_start_fund = 30.0
+        engine.live_source_fund = None
+        engine.live_strategy_start_fund = INITIAL_FUND
 
         write_heartbeat("startup_reconcile_begin")
         try:
