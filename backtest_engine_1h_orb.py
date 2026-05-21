@@ -21,6 +21,12 @@ from backtest_orb_setup_builder import (
     build_low_setup_for_day,
     select_entry_target_from_gate_and_39,
 )
+from backtest_orb_trade_simulator import (
+    resolve_same_candle_exit_with_m1,
+    fetch_m1_data_for_window,
+    compute_m1_mae_after_entry,
+    simulate_trade,
+)
 
 # Simple ANSI colors for terminal
 RESET = "\033[0m"
@@ -513,194 +519,29 @@ class BacktestEngine1HORB:
             return {"setup": sell_setup, "entry_result": sell_result}
 
     # ------------------ ENTRY WINDOW (PENDING) ------------------
-
     def _resolve_same_candle_exit_with_m1(
         self,
         side: str,
-        entry_time: datetime,
+        entry_time,
         actual_entry: float,
         sl: float,
         tp: float,
-    ) -> Optional[Dict]:
-        """
-        Same bar me entry + SL/TP ambiguity ko M1 sequence se resolve karo.
-
-        Return:
-            None -> M1 me entry confirm hi nahi hui
-            {
-                "result": "tp" | "sl" | "session_exit",
-                "exit_time": <pd.Timestamp>,
-                "exit_price": <float>,
-            }
-
-        Rules:
-        - Entry ke baad hi SL/TP valid hoga.
-        - Entry se pehle ka touch ignore hoga.
-        """
-        from_time = entry_time
-        to_time = entry_time + timedelta(hours=1)
-
-        try:
-            from live_data_mt5 import fetch_live_1m
-            m1_df = fetch_live_1m(self.pair, from_time, to_time)
-        except Exception as e:
-            print(
-                YELLOW
-                + f"  -> M1 fetch failed ({e}), keeping bar-level result as-is"
-                + RESET
-            )
-            return None
-
-        if m1_df is None or m1_df.empty:
-            print(YELLOW + "  -> M1 empty, keeping bar-level result as-is" + RESET)
-            return None
-
-        m1_df["time"] = pd.to_datetime(m1_df["time"])
-        m1_df = m1_df[
-            (m1_df["time"] >= from_time) & (m1_df["time"] <= to_time)
-        ].copy()
-        m1_df = m1_df.sort_values("time").reset_index(drop=True)
-
-        entry_found = False
-        entry_bar_time = None
-
-        for _, row in m1_df.iterrows():
-            o = float(row["open"])
-            h = float(row["high"])
-            l = float(row["low"])
-            t = row["time"]
-
-            # ----- 1) ENTRY CHECK -----
-            if side == "B":
-                entry_hit = h >= actual_entry
-            else:
-                entry_hit = l <= actual_entry
-
-            if not entry_found:
-                if not entry_hit:
-                    continue
-
-                entry_found = True
-                entry_bar_time = t
-                print(CYAN + f"  -> M1 entry confirmed at/after {t}" + RESET)
-
-                # Same M1 candle me immediate TP/SL check
-                if side == "B":
-                    tp_hit = h >= tp
-                    sl_hit = l <= sl
-                else:
-                    tp_hit = l <= tp
-                    sl_hit = h >= sl
-
-                if tp_hit and sl_hit:
-                    print(
-                        YELLOW
-                        + "  -> Same M1 candle me entry + TP/SL ambiguity, conservative SL applied"
-                        + RESET
-                    )
-                    return {
-                        "result": "sl",
-                        "exit_time": t,
-                        "exit_price": sl,
-                    }
-
-                if tp_hit:
-                    return {
-                        "result": "tp",
-                        "exit_time": t,
-                        "exit_price": tp,
-                    }
-                if sl_hit:
-                    return {
-                        "result": "sl",
-                        "exit_time": t,
-                        "exit_price": sl,
-                    }
-
-                # entry candle processed, next loop me post-entry candles handle honge
-                continue
-
-            # ----- 2) POST-ENTRY CANDLES -----
-            if side == "B":
-                tp_hit = h >= tp
-                sl_hit = l <= sl
-            else:
-                tp_hit = l <= tp
-                sl_hit = h >= sl
-
-            if tp_hit and sl_hit:
-                print(
-                    YELLOW
-                    + f"  -> Post-entry same M1 ambiguity at {t}, conservative SL applied"
-                    + RESET
-                )
-                return {
-                    "result": "sl",
-                    "exit_time": t,
-                    "exit_price": sl,
-                }
-
-            if tp_hit:
-                return {
-                    "result": "tp",
-                    "exit_time": t,
-                    "exit_price": tp,
-                }
-
-            if sl_hit:
-                return {
-                    "result": "sl",
-                    "exit_time": t,
-                    "exit_price": sl,
-                }
-
-        # Entry candle hi nahi mila → bar-level pe depend karo
-        if not entry_found:
-            print(
-                YELLOW
-                + "  -> M1 could not confirm entry, keeping bar-level result as-is"
-                + RESET
-            )
-            return None
-
-        # Entry mil gayi, lekin 1h window me na TP na SL → treat as session_exit in M1 window
-        last_row = m1_df.iloc[-1]
-        return {
-            "result": "session_exit",
-            "exit_time": last_row["time"],
-            "exit_price": float(last_row["close"]),
-        }
-
-        # ------------------ TRADE SIMULATION (MULTI-DAY) ------------------
+    ):
+        return resolve_same_candle_exit_with_m1(
+            engine=self,
+            side=side,
+            entry_time=entry_time,
+            actual_entry=actual_entry,
+            sl=sl,
+            tp=tp,
+        )
 
     def _fetch_m1_data_for_window(self, start_time, end_time):
-        try:
-            df_m1 = fetch_live_1m(
-                self.pair,
-                start=start_time - timedelta(minutes=1),
-                end=end_time + timedelta(minutes=1),
-            )
-        except Exception as e:
-            print(
-                YELLOW
-                + f"  -> Failed to fetch M1 data for MAE window: {e}"
-                + RESET
-            )
-            return pd.DataFrame()
-
-        if df_m1 is None or df_m1.empty:
-            return pd.DataFrame()
-
-        df_m1 = df_m1.copy()
-        df_m1["time"] = pd.to_datetime(df_m1["time"])
-        df_m1 = df_m1.sort_values("time").reset_index(drop=True)
-
-        return df_m1[
-            (df_m1["time"] >= start_time)
-            & (df_m1["time"] <= end_time)
-        ].copy()
-
-    # ------------------ TRADE SIMULATION (MULTI-DAY) ------------------
+        return fetch_m1_data_for_window(
+            engine=self,
+            start_time=start_time,
+            end_time=end_time,
+        )
 
     def _compute_m1_mae_after_entry(
         self,
@@ -710,311 +551,8 @@ class BacktestEngine1HORB:
         actual_entry: float,
         lot_size: float,
     ):
-        try:
-            m1_df = self._fetch_m1_data_for_window(entry_time, exit_time)
-        except Exception as e:
-            print(
-                YELLOW
-                + f"  -> M1 MAE fetch failed: {e}"
-                + RESET
-            )
-            return 0.0, 0.0
-
-        if m1_df is None or m1_df.empty:
-            print(
-                YELLOW
-                + "  -> No M1 data in window for MAE, returning 0"
-                + RESET
-            )
-            return 0.0, 0.0
-        print(
-            CYAN
-            + f"  -> M1 MAE window {self.pair} {entry_time} -> {exit_time}, rows={len(m1_df)}"
-            + RESET
-        )
-
-        pip_value = StrategyCalculator.get_pip_value_per_lot(
-            self.pair, actual_entry
-        )
-        pip_multiplier = 100.0 if self.pair.endswith("JPY") else 10000.0
-
-        max_adverse_pips = 0.0
-        max_adverse_amount = 0.0
-
-        for _, row in m1_df.iterrows():
-            candle_time = row["time"]
-
-            # Entry se pehle ka sab ignore
-            if candle_time < entry_time:
-                continue
-
-            if side == "B":
-                adverse_pips = max(
-                    0.0, (actual_entry - float(row["low"])) * pip_multiplier
-                )
-            else:
-                adverse_pips = max(
-                    0.0, (float(row["high"]) - actual_entry) * pip_multiplier
-                )
-
-            adverse_amount = adverse_pips * pip_value * lot_size
-
-            if adverse_amount > max_adverse_amount:
-                max_adverse_amount = adverse_amount
-                max_adverse_pips = adverse_pips
-
-        return round(max_adverse_pips, 1), round(max_adverse_amount, 2)
-
-    def _simulate_trade(
-        self,
-        df: pd.DataFrame,          # FULL DATA, not day_df
-        setup: Dict,
-        entry_idx,                 # label index in full df
-        actual_entry: float,
-    ) -> Dict:
-        """
-        Simulate trade from entry until SL/TP or data end (multi-day).
-        No time-based force exit; only TP/SL or data end.
-
-        IMPORTANT MAE RULE:
-        - H1 candle ka pre-entry low/high MAE me count nahi hoga.
-        - Final MAE will be computed from M1 candles AFTER actual entry.
-
-        10H SL_BE RULE (HYBRID):
-        - Entry ke 10 hours baad agar trade abhi open hai:
-        * TP ko entry->TP distance ke 80% par reduce karo
-        * SL ko entry se 10% distance aage profit me shift karo
-            (BUY: entry + 0.1*dist, SELL: entry - 0.1*dist)
-        """
-
-        side = setup["side"]
-        sl = setup["sl"]
-        tp = setup["tp"]
-        lot_size = setup["lot_size"]
-        entry_mode = setup.get("entry_mode", "")
-
-        entry_row = df.loc[entry_idx]
-        entry_time = entry_row["time"]
-        entry_day = entry_time.date()
-
-        try:
-            pair_str = getattr(self, "pair", "UNKNOWN")
-        except Exception:
-            pair_str = "UNKNOWN"
-
-        print(
-            CYAN
-            + f"     -> {pair_str} {side} TRADE | "
-            f"Entry={entry_time} @ {actual_entry:.5f} | "
-            f"LotSize={lot_size:.2f}"
-            + RESET
-        )
-
-        tp_adjusted = False
-        be_applied = False
-
-        pos = df.index.get_loc(entry_idx)
-        idx = pos
-
-        exit_price = actual_entry
-        exit_time = entry_time
-        result = "session_exit"
-
-        pip_value = StrategyCalculator.get_pip_value_per_lot(
-            self.pair, actual_entry)
-        pip_multiplier = 100.0 if self.pair.endswith("JPY") else 10000.0
-
-        max_adverse_pips = 0.0
-        max_adverse_amount = 0.0
-
-        while idx < len(df):
-            row = df.iloc[idx]
-            row_time = row["time"]
-            high = row["high"]
-            low = row["low"]
-
-            # ---------- 1) TIME-BASED 10H SL_BE (10% lock) + 80% TP ----------
-            if ((row_time - entry_time) >= timedelta(hours=10)) and (not be_applied):
-                if side == "B":
-                    orig_tp_dist = tp - actual_entry
-                else:
-                    orig_tp_dist = actual_entry - tp
-
-                if orig_tp_dist > 0:
-                    lock_dist = orig_tp_dist * 0.10       # 10% profit lock
-                    new_tp_dist = orig_tp_dist * 0.80     # 80% target
-
-                    if side == "B":
-                        new_sl = actual_entry + lock_dist
-                        new_tp = actual_entry + new_tp_dist
-                    else:
-                        new_sl = actual_entry - lock_dist
-                        new_tp = actual_entry - new_tp_dist
-
-                    print(
-                        CYAN
-                        + f"  -> 10h passed, SL_BE+TP80 applied at {row_time}: "
-                        f"SL {sl:.5f} -> {new_sl:.5f}, TP {tp:.5f} -> {new_tp:.5f}"
-                        + RESET
-                    )
-                    sl = new_sl
-                    tp = new_tp
-                    be_applied = True
-
-            # ---------- 2) DAY CHANGE TP REDUCTION (~2R -> ~1.5R) ----------
-            if (row_time.date() != entry_day) and (not tp_adjusted):
-                if side == "B":
-                    orig_tp_dist = tp - actual_entry
-                else:
-                    orig_tp_dist = actual_entry - tp
-
-                if orig_tp_dist > 0:
-                    new_tp_dist = orig_tp_dist * 0.75
-                    old_tp = tp
-                    if side == "B":
-                        tp = actual_entry + new_tp_dist
-                    else:
-                        tp = actual_entry - new_tp_dist
-                    tp_adjusted = True
-                    print(
-                        CYAN
-                        + f"  -> Day changed, TP reduced from {old_tp:.5f} to {tp:.5f} (~1:1.5) at {row_time}"
-                        + RESET
-                    )
-
-            hit_same_candle = False
-            hit_type = None
-
-            # ---------- 3) TP / SL HIT CHECKS ----------
-            if side == "B":
-                if high >= tp:
-                    exit_price = tp
-                    exit_time = row_time
-                    result = "tp"
-                    if row_time == entry_time:
-                        hit_same_candle = True
-                        hit_type = "tp"
-                    else:
-                        break
-                if low <= sl:
-                    exit_price = sl
-                    exit_time = row_time
-                    result = "sl_lock10" if be_applied else "sl"
-                    if row_time == entry_time:
-                        hit_same_candle = True
-                        hit_type = "sl"
-                    else:
-                        break
-            else:
-                if low <= tp:
-                    exit_price = tp
-                    exit_time = row_time
-                    result = "tp"
-                    if row_time == entry_time:
-                        hit_same_candle = True
-                        hit_type = "tp"
-                    else:
-                        break
-                if high >= sl:
-                    exit_price = sl
-                    exit_time = row_time
-                    result = "sl_lock10" if be_applied else "sl"
-                    if row_time == entry_time:
-                        hit_same_candle = True
-                        hit_type = "sl"
-                    else:
-                        break
-
-            # ---------- 4) SAME-CANDLE M1 RESOLUTION ----------
-            if hit_same_candle and hit_type is not None:
-                print(
-                    CYAN
-                    + f"  -> Same bar {hit_type.upper()} at {row_time}, checking M1 sequence..."
-                    + RESET
-                )
-
-                resolved = self._resolve_same_candle_exit_with_m1(
-                    side=side,
-                    entry_time=entry_time,
-                    actual_entry=actual_entry,
-                    sl=sl,
-                    tp=tp,
-                )
-
-                if resolved is None:
-                    print(
-                        YELLOW
-                        + "  -> M1 could not confirm entry, keeping bar-level result as-is"
-                        + RESET
-                    )
-                    break
-
-                m1_result = resolved.get("result")
-                m1_exit_time = resolved.get("exit_time")
-                m1_exit_price = resolved.get("exit_price")
-
-                if m1_result not in ("tp", "sl", "session_exit") or m1_exit_time is None:
-                    print(
-                        YELLOW
-                        + "  -> M1 returned invalid result, keeping bar-level result as-is"
-                        + RESET
-                    )
-                    break
-
-                if m1_result != hit_type and m1_result in ("tp", "sl"):
-                    print(
-                        YELLOW
-                        + f"  -> M1 sequence override: bar said {hit_type.upper()}, "
-                        f"actual is {m1_result.upper()} at {m1_exit_time}"
-                        + RESET
-                    )
-
-                if m1_result == "tp":
-                    exit_price = m1_exit_price if m1_exit_price is not None else tp
-                    result = "tp"
-                elif m1_result == "sl":
-                    exit_price = m1_exit_price if m1_exit_price is not None else sl
-                    result = "sl_lock10" if be_applied else "sl"
-                else:
-                    exit_price = m1_exit_price
-                    result = "session_exit"
-
-                exit_time = m1_exit_time
-                break
-
-            idx += 1
-
-        # ---------- 5) SESSION EXIT (DATA END) ----------
-        if result == "session_exit":
-            last_row = df.iloc[-1]
-            exit_price = last_row["close"]
-            exit_time = last_row["time"]
-
-        # ---------- 6) PNL ----------
-        if side == "B":
-            pnl_pips = (exit_price - actual_entry) * pip_multiplier
-        else:
-            pnl_pips = (actual_entry - exit_price) * pip_multiplier
-
-        pnl_amount = pnl_pips * pip_value * lot_size
-
-        balance_before_trade = self.current_fund
-
-        self.current_fund += pnl_amount
-        self.equity_high = max(self.equity_high, self.current_fund)
-        drawdown = self.equity_high - self.current_fund
-        self.max_drawdown = max(self.max_drawdown, drawdown)
-
-        if self.current_fund <= 0:
-            print(
-                YELLOW
-                + f"  -> Fund depleted (fund={self.current_fund:.2f}), stopping further trades"
-                + RESET
-            )
-            self.stop_requested = True
-
-        # ---------- 7) FINAL TRUE MAE FROM M1 ----------
-        m1_mae_pips, m1_mae_amount = self._compute_m1_mae_after_entry(
+        return compute_m1_mae_after_entry(
+            engine=self,
             side=side,
             entry_time=entry_time,
             exit_time=exit_time,
@@ -1022,37 +560,20 @@ class BacktestEngine1HORB:
             lot_size=lot_size,
         )
 
-        max_adverse_pips = m1_mae_pips
-        max_adverse_amount = m1_mae_amount
-
-        min_available_balance_during_trade = balance_before_trade - max_adverse_amount
-
-        trade_record = {
-            "date": entry_time.date(),
-            "pair": self.pair,
-            "side": side,
-            "entry_time": entry_time,
-            "entry_price": actual_entry,
-            "sl": sl,
-            "tp": tp,
-            "exit_time": exit_time,
-            "exit_price": exit_price,
-            "result": result,
-            "pnl_pips": round(pnl_pips, 1),
-            "pnl_amount": round(pnl_amount, 2),
-            "fund_after": round(self.current_fund, 2),
-            "max_adverse_pips": round(max_adverse_pips, 1),
-            "max_adverse_amount": round(max_adverse_amount, 2),
-            "balance_before_trade": round(balance_before_trade, 2),
-            "min_available_balance_during_trade": round(min_available_balance_during_trade, 2),
-            "entry_mode": entry_mode,
-            "sl_mode": "LOCK10_TP80" if be_applied else "NORMAL",
-            "lot_size": round(lot_size, 2),
-        }
-        self.trades.append(trade_record)
-        self.total_trades += 1
-
-        return trade_record
+    def _simulate_trade(
+        self,
+        df: pd.DataFrame,
+        setup: Dict,
+        entry_idx,
+        actual_entry: float,
+    ):
+        return simulate_trade(
+            engine=self,
+            df=df,
+            setup=setup,
+            entry_idx=entry_idx,
+            actual_entry=actual_entry,
+        )
 
     def run_backtest(self, specs) -> None:
         data_by_pair, all_dates = prepare_backtest_data(self, specs)
