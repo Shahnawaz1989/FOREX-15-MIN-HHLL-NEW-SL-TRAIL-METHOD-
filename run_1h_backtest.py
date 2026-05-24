@@ -1,173 +1,140 @@
-# run_1h_backtest.py
-
 from backtest_engine_1h_orb import BacktestEngine1HORB
-from live_data_mt5 import fetch_live_15m
+from live_data_mt5 import fetch_live_1h
 from order_mt5 import init_mt5, shutdown_mt5
-import pandas as pd
-"""
-BACKTEST / LIVE CHECK CONFIGURATION
-"""
+import os
 
-# Date Range (MT5 data ke andar se filter)
-START_DATE = "2026-04-01"   # YYYY-MM-DD
-END_DATE = "2026-04-30"     # YYYY-MM-DD
-
-# Trading Parameters
-INITIAL_FUND = 30.0        # Starting capital in dollars
-INITIAL_RISK = 8.0         # Risk percentage per trade
-
-# ============================================
-# PAIR CONFIGURATION
-# ============================================
-
-# Master pair list (all available pairs)
-MASTER_PAIRS = [
+PAIRS = [
     "AUDCAD.ecn",
     "AUDUSD.ecn",
-    "AUDCHF.ecn",
-    "CADCHF.ecn",
     "EURAUD.ecn",
     "EURCAD.ecn",
-    "EURCHF.ecn",
     "EURUSD.ecn",
     "EURGBP.ecn",
     "GBPAUD.ecn",
     "GBPCAD.ecn",
-    "GBPCHF.ecn",
     "GBPUSD.ecn",
     "NZDCAD.ecn",
     "NZDUSD.ecn",
-    "NZDCHF.ecn",
-    "USDCAD.ecn",
-    "USDCHF.ecn",
 ]
 
-# Enable list
-# Agar empty chhodo ge to system MASTER_PAIRS me se sab lega
-# except jo DISABLE_PAIRS me honge
-ENABLE_PAIRS = [
-    "AUDCAD.ecn",
-    "AUDUSD.ecn",
-    "AUDCHF.ecn",
-    "CADCHF.ecn",
-    "EURAUD.ecn",
-    "EURCAD.ecn",
-    "EURCHF.ecn",
-    "EURUSD.ecn",
-    "EURGBP.ecn",
-    "GBPAUD.ecn",
-    "GBPCAD.ecn",
-    "GBPCHF.ecn",
-    "GBPUSD.ecn",
-    "NZDCAD.ecn",
-    "NZDUSD.ecn",
-    "NZDCHF.ecn",
-    "USDCAD.ecn",
-    "USDCHF.ecn",
-]
+INITIAL_FUND = 30.0
+INITIAL_RISK = 8.0
+DEFAULT_PAIR = PAIRS[0]
 
-# Disable list
-DISABLE_PAIRS = [
+SIGNAL_DIR = r"C:\Users\Uzair Khan\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5\Files"
 
-]
 
-# Final active pair list
-if ENABLE_PAIRS:
-    PAIRS = [p for p in ENABLE_PAIRS if p in MASTER_PAIRS and p not in DISABLE_PAIRS]
-else:
-    PAIRS = [p for p in MASTER_PAIRS if p not in DISABLE_PAIRS]
+def get_signal_file(pair: str) -> str:
+    safe_pair = pair.replace("/", "_")
+    return os.path.join(SIGNAL_DIR, f"live_signal_{safe_pair}.txt")
 
-# MT5 se kitne din ka ecn data laye (START_DATE–END_DATE ko cover kare)
-LOOKBACK_DAYS = 720
 
-# Output
-EXCEL_FILENAME = "backtest_15m_session_orb_results.xlsx"
+def read_existing_status(signal_file: str):
+    if not os.path.exists(signal_file):
+        return None, None
 
-# ============================================
-# NO NEED TO EDIT BELOW THIS LINE
-# ============================================
+    try:
+        with open(signal_file, "r", encoding="utf-8") as f:
+            line = f.read().strip()
 
-if __name__ == "__main__":
-    if not PAIRS:
-        raise ValueError(
-            "No pairs selected. Please check ENABLE_PAIRS / DISABLE_PAIRS.")
+        if not line:
+            return None, None
 
-    unknown_enabled = [p for p in ENABLE_PAIRS if p not in MASTER_PAIRS]
-    unknown_disabled = [p for p in DISABLE_PAIRS if p not in MASTER_PAIRS]
+        parts = line.split("|")
+        if len(parts) < 15:
+            return None, None
 
-    if unknown_enabled:
-        raise ValueError(
-            f"These ENABLE_PAIRS are not in MASTER_PAIRS: {unknown_enabled}")
+        signal_id = parts[0]
+        status = parts[14]
+        return signal_id, status
+    except Exception:
+        return None, None
 
-    if unknown_disabled:
-        raise ValueError(
-            f"These DISABLE_PAIRS are not in MASTER_PAIRS: {unknown_disabled}")
 
-    enabled_pairs = PAIRS
-    disabled_pairs = [p for p in MASTER_PAIRS if p not in PAIRS]
+def write_dual_signal_for_ea(signal: dict, pair: str):
+    signal_file = get_signal_file(pair)
+    signal_id = f"{pair}_{signal['day']}"
 
-    print("=" * 60)
-    print("15M SESSION ORB BACKTEST / LIVE CHECK (MT5 DATA)")
-    print("=" * 60)
-    print(f"Date Range:     {START_DATE} to {END_DATE}")
-    print(f"Initial Fund:   ${INITIAL_FUND}")
-    print(f"Base Risk:      {INITIAL_RISK:.1f}% (weekly ramp)")
-    print(f"Enabled Pairs:  {', '.join(enabled_pairs)}")
-    print(f"Disabled Pairs: {', '.join(disabled_pairs)}")
-    print(f"LookbackDays:   {LOOKBACK_DAYS}")
-    print(f"Output Excel:   {EXCEL_FILENAME}")
-    print("=" * 60)
+    existing_signal_id, existing_status = read_existing_status(signal_file)
+    existing_status = str(existing_status or "").upper()
 
-    # Date helpers
-    start_dt = pd.to_datetime(START_DATE)
-    end_dt = pd.to_datetime(END_DATE)
-    total_weeks = ((end_dt - start_dt).days // 7) + 1
-    print(f"Total weeks in range: {total_weeks}")
+    if existing_signal_id == signal_id and existing_status in {"NEW", "PLACED", "ENTRY_HIT", "ACTIVE"}:
+        print(
+            f"  -> Existing active signal already present for {pair}, skipping overwrite")
+        return
 
-    final_risk_preview = min(INITIAL_RISK + (total_weeks - 1) * 0.5, 5.0)
-    week2_preview = min(INITIAL_RISK + 0.5, 5.0)
+    if existing_signal_id == signal_id and existing_status in {
+        "TP",
+        "SL",
+        "COMPLETED",
+        "CANCELLED",
+        "CANCELLEDEOD",
+        "CANCELLEDNEWHHLL",
+    }:
+        print(
+            f"  -> Existing same-day signal already finalized for {pair}, refusing repeat write")
+        return
 
-    print(
-        f"Risk ramp: Week1={INITIAL_RISK:.1f}%, "
-        f"Week2={week2_preview:.1f}%, "
-        f"... Week{total_weeks}={final_risk_preview:.1f}%"
+    expiry_server = signal["expiry_server"]
+
+    line = (
+        f"{signal_id}|"
+        f"{pair}|"
+        f"{signal['breakout_side']}|"
+        f"{expiry_server}|"
+        f"{round(float(signal['buy']['entry']), 5)}|"
+        f"{round(float(signal['buy']['sl']), 5)}|"
+        f"{round(float(signal['buy']['tp']), 5)}|"
+        f"{round(float(signal['buy']['lot']), 2)}|"
+        f"{round(float(signal['sell']['entry']), 5)}|"
+        f"{round(float(signal['sell']['sl']), 5)}|"
+        f"{round(float(signal['sell']['tp']), 5)}|"
+        f"{round(float(signal['sell']['lot']), 2)}|"
+        f"25|15|NEW"
     )
 
+    os.makedirs(os.path.dirname(signal_file), exist_ok=True)
+
+    with open(signal_file, "w", encoding="utf-8") as f:
+        f.write(line)
+
+    print(f"  -> Dual signal written for EA: {signal_file}")
+    print(f"  -> FILE CONTENT WRITTEN: {line}")
+
+
+def main():
     init_mt5()
-    try:
-        engine = BacktestEngine1HORB(
-            initial_fund=INITIAL_FUND,
-            initial_risk_percent=INITIAL_RISK,
-            pair="DUMMY",
-        )
 
-        engine.start_date = start_dt.date()
-        engine.end_date = end_dt.date()
+    engine = BacktestEngine1HORB(
+        initial_fund=INITIAL_FUND,
+        initial_risk_percent=INITIAL_RISK,
+        pair=DEFAULT_PAIR,
+    )
 
-        specs = []
+    engine.use_live_equity_sizing = True
+    engine.live_source_fund = None
+    engine.live_strategy_start_fund = INITIAL_FUND
 
-        for pair in PAIRS:
-            temp_csv = f"_temp_{pair.replace('.', '_')}.csv"
-            print(f"\nFetching live 15M data for {pair} from MT5...")
-            df = fetch_live_15m(pair, lookback_days=LOOKBACK_DAYS)
+    for pair in PAIRS:
+        print("\n" + "=" * 40)
+        print(f"Checking live dual signal for {pair}")
 
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            mask = (
-                (df["datetime"].dt.date >= start_dt.date())
-                & (df["datetime"].dt.date <= end_dt.date())
-            )
-            df = df.loc[mask].reset_index(drop=True)
+        try:
+            df_1h = fetch_live_1h(pair, lookback_days=5)
+        except Exception as e:
+            print(f"  -> Failed to fetch 1H data for {pair}: {e}")
+            continue
 
-            if df.empty:
-                print(f"  -> {pair}: no data in selected date range, skipping")
-                continue
+        signal = engine.generate_live_dual_signal_for_latest_day(pair, df_1h)
+        if not signal:
+            print(f"  -> No dual signal for {pair}")
+            continue
 
-            df.to_csv(temp_csv, index=False)
-            specs.append({"pair": pair, "csv": temp_csv})
+        write_dual_signal_for_ea(signal, pair)
+        print(f"  -> {pair} dual signal processing done")
 
-        engine.run_backtest(specs)
-        engine.export_to_excel(EXCEL_FILENAME)
+    shutdown_mt5()
 
-        print("\nDone on MT5 live 15M data for selected date range.")
-    finally:
-        shutdown_mt5()
+
+if __name__ == "__main__":
+    main()
