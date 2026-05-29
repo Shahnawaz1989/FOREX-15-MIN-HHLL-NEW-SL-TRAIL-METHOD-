@@ -40,6 +40,9 @@ from live_registry_manager import (
     is_same_completed_trade_prices,
     has_any_completed_trade_for_pair_day,
     has_active_registry_signal_for_pair_day_side,
+    get_active_registry_signal_for_pair_day_side,
+    is_same_setup_signature,
+    is_newer_setup_than_row,
     is_setup_in_hhll_disable_window,
     parse_registry_ts,
     get_signal_expiry_from_row,
@@ -185,8 +188,8 @@ class BacktestEngine1HORB:
 
         # SERVER-time HH/LL disable window:
         # Detection allowed, but new order processing blocked in this window.
-        self.hhll_disable_start_server = time(11, 15)
-        self.hhll_disable_end_server = time(16, 45)
+        self.hhll_disable_start_server = time(12, 00)
+        self.hhll_disable_end_server = time(23, 45)
 
         # 🔹 Local Gann lookup load (JSON)
         self.gann_lookup = self._load_gann_lookup("forex_gann_lookup_1_3.json")
@@ -772,6 +775,15 @@ class BacktestEngine1HORB:
     def _has_active_registry_signal_for_pair_day_side(self, pair: str, day, side: str) -> bool:
         return has_active_registry_signal_for_pair_day_side(pair, day, side)
 
+    def _get_active_registry_signal_for_pair_day_side(self, pair: str, day, side: str):
+        return get_active_registry_signal_for_pair_day_side(pair, day, side)
+
+    def _is_same_setup_signature(self, row: Dict, setup: dict, price_tol: float = 0.00005) -> bool:
+        return is_same_setup_signature(row, setup, price_tol=price_tol)
+
+    def _is_newer_setup_than_row(self, row: Dict, setup: dict) -> bool:
+        return is_newer_setup_than_row(row, setup)
+
     def _is_setup_in_hhll_disable_window(self, setup: dict) -> bool:
         return is_setup_in_hhll_disable_window(
             setup=setup,
@@ -787,6 +799,93 @@ class BacktestEngine1HORB:
 
     def _scan_signal_outcome_from_df(self, df: pd.DataFrame, row: Dict):
         return scan_signal_outcome_from_df(df, row)
+
+    def _finalize_signal_from_market_before_cancel(self, signal_id: str, pair: str, day) -> bool:
+        try:
+            reg = self._load_live_registry()
+            row = reg.get(signal_id)
+            if not row:
+                return False
+
+            row_completed = bool(row.get("completed", False))
+            row_status = str(row.get("registry_status", "")).strip().upper()
+            row_exit_result = str(row.get("exit_result", "")).strip().lower()
+
+            # Already finalized, kuch karne ki zarurat nahi
+            if (
+                row_completed
+                or row_status == "COMPLETED"
+                or row_exit_result in {"tp", "sl", "sl_lock10", "session_exit"}
+            ):
+                return True
+
+            # Latest 15m data fetch
+            from live_data_mt5 import fetch_live_15m
+
+            df = fetch_live_15m(pair, lookback_days=30)
+            if df is None or df.empty:
+                return False
+
+            df = df.copy()
+            if "time" in df.columns:
+                df["time"] = pd.to_datetime(df["time"], errors="coerce")
+            elif "datetime" in df.columns:
+                df["time"] = pd.to_datetime(df["datetime"], errors="coerce")
+            else:
+                return False
+
+            df = df.dropna(subset=["time"]).sort_values(
+                "time").reset_index(drop=True)
+            if df.empty:
+                return False
+
+            outcome = self._scan_signal_outcome_from_df(df, row)
+            if outcome is None:
+                return False
+
+            result = str(outcome.get("result", "")).strip().lower()
+            entry_hit = bool(outcome.get("entry_hit", False))
+            entry_time = outcome.get("entry_time")
+            exit_time = outcome.get("exit_time")
+
+            if entry_hit:
+                row["entry_hit"] = True
+                row["entry_time"] = self._fmt_live_ts(entry_time)
+                row["exit_time"] = self._fmt_live_ts(exit_time)
+
+            if result in {"tp", "sl", "sl_lock10"}:
+                row["exit_result"] = result
+                row["registry_status"] = "COMPLETED"
+                row["completed"] = True
+                row["last_updated"] = datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S")
+                reg[signal_id] = row
+                self._save_live_registry(reg)
+                print(
+                    f" -> Finalized before cancel: {signal_id} result={result}")
+                return True
+
+            if result == "open_or_expired":
+                expiry = self._get_signal_expiry_from_row(row)
+                now_ts = df.iloc[-1]["time"] if not df.empty else None
+                if expiry is not None and now_ts is not None and now_ts > expiry:
+                    row["exit_result"] = "session_exit"
+                    row["registry_status"] = "COMPLETED"
+                    row["completed"] = True
+                    row["last_updated"] = datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                    reg[signal_id] = row
+                    self._save_live_registry(reg)
+                    print(
+                        f" -> Finalized before cancel: {signal_id} result=session_exit")
+                    return True
+
+            return False
+
+        except Exception as e:
+            print(
+                f" -> _finalize_signal_from_market_before_cancel failed for {signal_id}: {e}")
+            return False
 
     def _reconcile_open_registry_signals_with_market_data(self, pair: str, df: pd.DataFrame):
         return reconcile_open_registry_signals_with_market_data(
@@ -822,6 +921,11 @@ class BacktestEngine1HORB:
             max_spread_points=max_spread_points,
             max_slippage_points=max_slippage_points,
             reason=reason,
+            pre_cancel_finalize_fn=lambda signal_id: self._finalize_signal_from_market_before_cancel(
+                signal_id=signal_id,
+                pair=pair,
+                day=day,
+            ),
         )
 
     def _write_fresh_signal_after_strict_delete(
@@ -862,11 +966,21 @@ class BacktestEngine1HORB:
             reason=reason,
         )
 
-    def _build_live_cancel_payload(self, pair: str, day, max_spread_points=25, max_slippage_points=15):
+    def _build_live_cancel_payload(
+        self,
+        pair: str,
+        day,
+        existing_signal_id: str = "",
+        existing_side: str = "",
+        max_spread_points=25,
+        max_slippage_points=15,
+    ):
         return build_live_cancel_payload(
             live_signal_expiry_server_fn=self._live_signal_expiry_server,
             pair=pair,
             day=day,
+            existing_signal_id=existing_signal_id,
+            existing_side=existing_side,
             max_spread_points=max_spread_points,
             max_slippage_points=max_slippage_points,
         )

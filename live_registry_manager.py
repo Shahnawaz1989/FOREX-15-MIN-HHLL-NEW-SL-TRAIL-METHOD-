@@ -74,12 +74,28 @@ def mark_signal_completed_in_registry(signal_id: str, trade: Dict):
 
 def mark_signal_non_completed_in_registry(signal_id: str, status: str):
     reg = load_live_registry()
-    if signal_id not in reg:
-        reg[signal_id] = {"signal_id": signal_id}
+    row = reg.get(signal_id)
 
-    reg[signal_id]["registry_status"] = str(status).upper()
-    reg[signal_id]["completed"] = False
-    reg[signal_id]["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not row:
+        return
+
+    row_status = str(row.get("registry_status", "")).strip().upper()
+    row_completed = bool(row.get("completed", False))
+    row_exit_result = str(row.get("exit_result", "")).strip().lower()
+
+    if (
+        row_completed
+        or row_status == "COMPLETED"
+        or row_exit_result in {"tp", "sl", "sl_lock10", "session_exit"}
+    ):
+        print(f" -> Refusing to downgrade finalized row: {signal_id}")
+        return
+
+    row["registry_status"] = str(status).strip().upper()
+    row["completed"] = False
+    row["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    reg[signal_id] = row
     save_live_registry(reg)
 
 
@@ -194,6 +210,93 @@ def has_active_registry_signal_for_pair_day_side(pair: str, day, side: str) -> b
     return False
 
 
+def get_active_registry_signal_for_pair_day_side(pair: str, day, side: str):
+    reg = load_live_registry()
+    day_str = str(day)
+    side = str(side).strip().upper()
+
+    active_statuses = {
+        "GENERATED",
+        "NEW",
+        "PLACED",
+        "ENTRY_HIT",
+        "BE_APPLIED",
+        "LOCK10_APPLIED",
+        "ACTIVE",
+    }
+
+    candidates = []
+
+    for signal_id, row in reg.items():
+        row_pair = str(row.get("pair", "")).strip()
+        row_day = str(row.get("day", "")).strip()
+        row_side = str(row.get("side", "")).strip().upper()
+        row_completed = bool(row.get("completed", False))
+        row_status = str(row.get("registry_status", "")).strip().upper()
+
+        if row_pair != pair or row_day != day_str or row_side != side:
+            continue
+        if row_completed:
+            continue
+        if row_status not in active_statuses:
+            continue
+
+        candidates.append((signal_id, row))
+
+    if not candidates:
+        return None, None
+
+    candidates.sort(
+        key=lambda x: (
+            pd.to_datetime(x[1].get("trigger_time"), errors="coerce")
+            if str(x[1].get("trigger_time", "")).strip()
+            else pd.Timestamp.min
+        )
+    )
+    return candidates[-1]
+
+
+def is_same_setup_signature(row: Dict, setup: dict, price_tol: float = 0.00005) -> bool:
+    if not row or not setup:
+        return False
+
+    def _as_float(x, default=0.0):
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    def _same_price(a, b):
+        return abs(_as_float(a) - _as_float(b)) <= price_tol
+
+    row_trigger = fmt_live_ts(row.get("trigger_time"))
+    new_trigger = fmt_live_ts(setup.get("trigger_time"))
+
+    return (
+        str(row.get("side", "")).strip().upper() == str(
+            setup.get("side", "")).strip().upper()
+        and row_trigger == new_trigger
+        and _same_price(row.get("entry", 0.0), setup.get("entry", 0.0))
+        and _same_price(row.get("sl", 0.0), setup.get("sl", 0.0))
+        and _same_price(row.get("tp", 0.0), setup.get("tp", 0.0))
+    )
+
+
+def is_newer_setup_than_row(row: Dict, setup: dict) -> bool:
+    if not row or not setup:
+        return False
+
+    row_trigger = pd.to_datetime(row.get("trigger_time"), errors="coerce")
+    new_trigger = pd.to_datetime(setup.get("trigger_time"), errors="coerce")
+
+    if pd.isna(new_trigger):
+        return False
+    if pd.isna(row_trigger):
+        return True
+
+    return new_trigger > row_trigger
+
+
 def is_setup_in_hhll_disable_window(setup: dict, disable_start_server, disable_end_server) -> bool:
     if not setup:
         return False
@@ -236,8 +339,15 @@ def scan_signal_outcome_from_df(df: pd.DataFrame, row: Dict):
         return None
 
     df = df.copy()
-    df["time"] = pd.to_datetime(df["time"])
-    df = df.sort_values("time").reset_index(drop=True)
+
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    elif "datetime" in df.columns:
+        df["time"] = pd.to_datetime(df["datetime"], errors="coerce")
+    else:
+        return None
+
+    df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
 
     side = str(row.get("side", "")).upper().strip()
     entry = float(row.get("entry", 0.0))
@@ -283,6 +393,7 @@ def scan_signal_outcome_from_df(df: pd.DataFrame, row: Dict):
                             "entry_time": entry_time,
                             "exit_time": t,
                         }
+
             elif side == "S":
                 if low <= entry:
                     entry_hit = True
@@ -356,6 +467,28 @@ def reconcile_open_registry_signals_with_market_data(engine, pair: str, df: pd.D
     reg = load_live_registry()
     changed = False
 
+    now_ts = None
+    try:
+        if df is not None and not df.empty:
+            tmp_df = df.copy()
+
+            if "time" in tmp_df.columns:
+                tmp_df["time"] = pd.to_datetime(
+                    tmp_df["time"], errors="coerce")
+            elif "datetime" in tmp_df.columns:
+                tmp_df["time"] = pd.to_datetime(
+                    tmp_df["datetime"], errors="coerce")
+            else:
+                tmp_df["time"] = pd.NaT
+
+            tmp_df = tmp_df.dropna(subset=["time"]).sort_values(
+                "time").reset_index(drop=True)
+
+            if not tmp_df.empty:
+                now_ts = tmp_df.iloc[-1]["time"]
+    except Exception:
+        now_ts = None
+
     for signal_id, row in reg.items():
         row_pair = str(row.get("pair", "")).strip()
         row_completed = bool(row.get("completed", False))
@@ -367,28 +500,58 @@ def reconcile_open_registry_signals_with_market_data(engine, pair: str, df: pd.D
         if row_completed or row_status == "COMPLETED":
             continue
 
+        expiry = get_signal_expiry_from_row(row)
         outcome = scan_signal_outcome_from_df(df, row)
+
         if outcome is None:
+            if expiry is not None and now_ts is not None and now_ts > expiry:
+                if row_status not in {"ENTRY_HIT", "COMPLETED"}:
+                    row["registry_status"] = "ORDEREXPIRED1930"
+                    row["completed"] = False
+                    row["exit_result"] = "orderexpired1930"
+                    row["last_updated"] = datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                    reg[signal_id] = row
+                    changed = True
             continue
 
-        if outcome["entry_hit"]:
-            row["entry_hit"] = True
-            row["entry_time"] = str(outcome.get("entry_time", ""))
-            row["exit_time"] = str(outcome.get("exit_time", ""))
+        result = str(outcome.get("result", "")).lower()
+        entry_hit = bool(outcome.get("entry_hit", False))
+        exit_time = str(outcome.get("exit_time", ""))
+        entry_time = str(outcome.get("entry_time", ""))
 
-            result = str(outcome.get("result", "")).lower()
-            if result in {"tp", "sl"}:
+        if entry_hit:
+            row["entry_hit"] = True
+            row["entry_time"] = entry_time
+            row["exit_time"] = exit_time
+
+            if result in {"tp", "sl", "sl_lock10"}:
                 row["exit_result"] = result
                 row["registry_status"] = "COMPLETED"
                 row["completed"] = True
+
+            elif result == "open_or_expired":
+                if expiry is not None and now_ts is not None and now_ts > expiry:
+                    row["exit_result"] = "session_exit"
+                    row["registry_status"] = "COMPLETED"
+                    row["completed"] = True
+                else:
+                    row["registry_status"] = "ENTRY_HIT"
+                    row["completed"] = False
+
             else:
                 row["registry_status"] = "ENTRY_HIT"
                 row["completed"] = False
+
         else:
-            result = str(outcome.get("result", "")).lower()
             if result == "not_triggered":
-                row["registry_status"] = "GENERATED"
-                row["completed"] = False
+                if expiry is not None and now_ts is not None and now_ts > expiry:
+                    row["registry_status"] = "ORDEREXPIRED1930"
+                    row["completed"] = False
+                    row["exit_result"] = "orderexpired1930"
+                else:
+                    row["registry_status"] = "GENERATED"
+                    row["completed"] = False
 
         row["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         reg[signal_id] = row

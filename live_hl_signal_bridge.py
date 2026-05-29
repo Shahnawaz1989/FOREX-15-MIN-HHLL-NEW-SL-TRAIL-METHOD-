@@ -30,6 +30,7 @@ PAIRS = [
     "NZDCHF.ecn",
     "USDCAD.ecn",
     "USDCHF.ecn",
+
 ]
 
 INITIAL_FUND = 30.0
@@ -39,7 +40,7 @@ LOOKBACK_DAYS = 30
 MAX_SPREAD_POINTS = 25
 MAX_SLIPPAGE_POINTS = 15
 
-SIGNAL_DIR = r"C:\Users\Administrator\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5\Files"
+SIGNAL_DIR = r"C:\Users\Uzair Khan\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5\Files"
 REGISTRY_FILE = r"live_registry/hl_live_registry.json"
 
 
@@ -82,14 +83,95 @@ def process_pair(engine: BacktestEngine1HORB, pair: str):
         print("  -> Data empty after datetime parsing")
         return
 
+    df["time"] = df["datetime"]
+
     latest_day = df["datetime"].dt.date.max()
     print(f"  -> {pair} max datetime in 15m df = {df['datetime'].max()}")
     print(df[["datetime", "open", "high", "low", "close"]].tail(5))
 
+    # 1) Reconcile old/open rows
+    try:
+        engine._reconcile_open_registry_signals_with_market_data(
+            pair=pair,
+            df=df,
+        )
+    except Exception as e:
+        print(f"  -> First reconcile failed for {pair}: {e}")
+
+    # 2) Generate / refresh latest day signals
+    result = engine.generate_live_dual_signals_for_latest_day(
+        pair=pair,
+        df_15m=df,
+        signal_dir=SIGNAL_DIR,
+        max_spread_points=MAX_SPREAD_POINTS,
+        max_slippage_points=MAX_SLIPPAGE_POINTS,
+    )
+
+    # 3) Reconcile newly generated rows
+    try:
+        engine._reconcile_open_registry_signals_with_market_data(
+            pair=pair,
+            df=df,
+        )
+    except Exception as e:
+        print(f"  -> Second reconcile failed for {pair}: {e}")
+
+    # 4) Force direct CANCEL write for completed rows
     try:
         reg = engine._load_live_registry()
-        active_rows = []
-        completed_rows = []
+
+        for signal_id, row in reg.items():
+            row_pair = str(row.get("pair", "")).strip()
+            row_day = str(row.get("day", "")).strip()
+            row_status = str(row.get("registry_status", "")).strip().upper()
+            row_completed = bool(row.get("completed", False))
+            side = str(row.get("side", "")).strip().upper()
+
+            if row_pair != pair or row_day != str(latest_day):
+                continue
+
+            if not (row_completed or row_status == "COMPLETED"):
+                continue
+
+            if side not in ("B", "S"):
+                continue
+
+            row_day_obj = pd.to_datetime(row_day, errors="coerce")
+            if pd.isna(row_day_obj):
+                print(
+                    f"  -> Skipping CANCEL for {signal_id}: invalid row_day={row_day}")
+                continue
+            row_day_obj = row_day_obj.date()
+
+            suffix = "BUY" if side == "B" else "SELL"
+            signal_file = os.path.join(
+                SIGNAL_DIR,
+                f"live_signal_{pair}_{suffix}.txt",
+            )
+
+            cancel_payload = engine._build_live_cancel_payload(
+                pair=pair,
+                day=row_day_obj,
+                max_spread_points=MAX_SPREAD_POINTS,
+                max_slippage_points=MAX_SLIPPAGE_POINTS,
+            )
+
+            cancel_payload["signal_id"] = signal_id
+            cancel_payload["symbol"] = pair
+            cancel_payload["side"] = side
+            cancel_payload["status"] = "NEW"
+
+            print(f"  -> Writing direct CANCEL for completed {signal_id}")
+            engine._write_live_signal_file(signal_file, cancel_payload)
+
+    except Exception as e:
+        print(f"  -> Direct completed CANCEL write failed for {pair}: {e}")
+
+    # 5) Snapshot
+    try:
+        reg = engine._load_live_registry()
+        active_count = 0
+        completed_count = 0
 
         for _, row in reg.items():
             row_pair = str(row.get("pair", "")).strip()
@@ -101,24 +183,16 @@ def process_pair(engine: BacktestEngine1HORB, pair: str):
                 continue
 
             if row_completed or row_status == "COMPLETED":
-                completed_rows.append(row)
+                completed_count += 1
             else:
-                active_rows.append(row)
+                active_count += 1
 
         print(
             f"  -> Registry snapshot for {pair} day={latest_day}: "
-            f"active={len(active_rows)}, completed={len(completed_rows)}"
+            f"active={active_count}, completed={completed_count}"
         )
     except Exception as e:
         print(f"  -> Registry snapshot failed for {pair}: {e}")
-
-    result = engine.generate_live_dual_signals_for_latest_day(
-        pair=pair,
-        df_15m=df,
-        signal_dir=SIGNAL_DIR,
-        max_spread_points=MAX_SPREAD_POINTS,
-        max_slippage_points=MAX_SLIPPAGE_POINTS,
-    )
 
     print(f"  -> Result for {pair}: {result}")
 
@@ -142,10 +216,8 @@ def main():
         engine.live_strategy_start_fund = INITIAL_FUND
 
         write_heartbeat("startup_reconcile_begin")
-        try:
-            engine.reconcile_open_registry_signals_with_market_data()
-        except Exception as e:
-            print(f"  -> Startup reconcile failed: {e}")
+        print(
+            "  -> Startup reconcile skipped (per-pair reconcile will run in process_pair)")
         write_heartbeat("startup_reconcile_done")
 
         write_heartbeat("cycle_start")

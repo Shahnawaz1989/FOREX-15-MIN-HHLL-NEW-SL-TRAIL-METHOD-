@@ -157,16 +157,45 @@ def generate_live_dual_signals_for_latest_day(
             f"  -> {pair} {day} SELL suppressed: same completed setup already closed")
         sell_setup = None
 
-    if buy_setup and engine._has_active_registry_signal_for_pair_day_side(pair, day, "B"):
-        print(
-            f"  -> {pair} {day} BUY suppressed: active registry signal already exists")
-        buy_setup = None
+    if buy_setup:
+        active_buy_id, active_buy_row = engine._get_active_registry_signal_for_pair_day_side(
+            pair, day, "B"
+        )
 
-    if sell_setup and engine._has_active_registry_signal_for_pair_day_side(pair, day, "S"):
-        print(
-            f"  -> {pair} {day} SELL suppressed: active registry signal already exists")
-        sell_setup = None
+        if active_buy_row:
+            if engine._is_same_setup_signature(active_buy_row, buy_setup):
+                print(
+                    f"  -> {pair} {day} BUY suppressed: same active setup already exists")
+                buy_setup = None
+            elif not engine._is_newer_setup_than_row(active_buy_row, buy_setup):
+                print(
+                    f"  -> {pair} {day} BUY suppressed: active setup is newer/equal")
+                buy_setup = None
+            else:
+                print(
+                    f"  -> {pair} {day} BUY new HH/LL detected, replacing old active setup "
+                    f"{active_buy_id}"
+                )
 
+    if sell_setup:
+        active_sell_id, active_sell_row = engine._get_active_registry_signal_for_pair_day_side(
+            pair, day, "S"
+        )
+
+        if active_sell_row:
+            if engine._is_same_setup_signature(active_sell_row, sell_setup):
+                print(
+                    f"  -> {pair} {day} SELL suppressed: same active setup already exists")
+                sell_setup = None
+            elif not engine._is_newer_setup_than_row(active_sell_row, sell_setup):
+                print(
+                    f"  -> {pair} {day} SELL suppressed: active setup is newer/equal")
+                sell_setup = None
+            else:
+                print(
+                    f"  -> {pair} {day} SELL new HH/LL detected, replacing old active setup "
+                    f"{active_sell_id}"
+                )
     reg = engine._load_live_registry()
     day_str = str(day)
 

@@ -60,14 +60,20 @@ def build_live_cancel_payload(
     live_signal_expiry_server_fn,
     pair: str,
     day,
+    existing_signal_id: str = "",
+    existing_side: str = "",
     max_spread_points=25,
     max_slippage_points=15,
 ):
+    signal_id = str(existing_signal_id or "").strip()
+    if not signal_id:
+        signal_id = f"{pair}_{day}_CANCEL"
+
     return {
         "action": "CANCEL",
-        "signal_id": f"{pair}_{day}_CANCEL",
+        "signal_id": signal_id,
         "symbol": pair,
-        "side": "",
+        "side": str(existing_side or "").strip().upper(),
         "expiry_server": live_signal_expiry_server_fn(day).strftime("%Y-%m-%d %H:%M:%S"),
         "entry": 0.0,
         "sl": 0.0,
@@ -131,10 +137,24 @@ def build_live_place_payload(
 
     row_completed = bool(row.get("completed", False))
     row_status = str(row.get("registry_status", "")).upper().strip()
+    row_exit_result = str(row.get("exit_result", "")).strip().lower()
 
-    if row_completed or row_status == "COMPLETED":
+    if (
+        row_completed
+        or row_status == "COMPLETED"
+        or row_exit_result in {"tp", "sl", "sl_lock10", "session_exit"}
+    ):
         print(
-            f" -> Existing registry row already completed, skip payload build: {signal_id}")
+            f" -> Existing registry row already finalized, skip payload build: {signal_id}"
+        )
+        return None
+
+    prev_row = reg.get(signal_id, {})
+    if (
+        bool(prev_row.get("completed", False))
+        or str(prev_row.get("registry_status", "")).upper().strip() == "COMPLETED"
+    ):
+        print(f" -> Refusing to overwrite completed row: {signal_id}")
         return None
 
     reg[signal_id] = {
@@ -360,6 +380,7 @@ def cancel_existing_signal_strict(
     max_spread_points: int,
     max_slippage_points: int,
     reason: str = "CANCELLEDNEWHHLL",
+    pre_cancel_finalize_fn=None,
 ):
     if existing is None:
         try:
@@ -371,17 +392,32 @@ def cancel_existing_signal_strict(
             print(f"  -> Failed deleting file {signal_file}: {e}")
         return
 
-    existing_status = str(existing.get("status", "")).upper()
+    existing_status = str(existing.get("status", "")).upper().strip()
     if existing_status in terminal_filled_statuses:
         print(
-            f"  -> Existing filled status {existing_status}, skip strict cancel: {signal_file}")
+            f"  -> Existing filled status {existing_status}, skip strict cancel: {signal_file}"
+        )
         return
 
     old_signal_id = str(existing.get("signal_id", "")).strip()
 
+    if pre_cancel_finalize_fn is not None and old_signal_id:
+        try:
+            finalized = bool(pre_cancel_finalize_fn(old_signal_id))
+            if finalized:
+                print(
+                    f"  -> Existing signal finalized before cancel, skip CANCEL: {old_signal_id}"
+                )
+                return
+        except Exception as e:
+            print(
+                f"  -> pre_cancel_finalize_fn failed for {old_signal_id}: {e}")
+
     cancel_payload = build_live_cancel_payload_fn(
         pair=pair,
         day=day,
+        existing_signal_id=old_signal_id,
+        existing_side=str(existing.get("side", "")).strip().upper(),
         max_spread_points=max_spread_points,
         max_slippage_points=max_slippage_points,
     )
@@ -421,7 +457,7 @@ def write_fresh_signal_after_strict_delete(
     print(f"[FRESH DBG] existing={existing}")
     print(f"[FRESH DBG] setup={setup}")
 
-    existing_status = str(existing_status or "").upper()
+    existing_status = str(existing_status or "").upper().strip()
     setup_side = str(setup.get("side", "")).upper().strip()
 
     print(f"[FRESH DBG] existing_status(norm)={existing_status}")
@@ -451,13 +487,16 @@ def write_fresh_signal_after_strict_delete(
 
     if same_side_completed:
         print(
-            f"[FRESH DBG] pair/day/side completed lock hit -> skip {pair} {day} side={setup_side}")
+            f"[FRESH DBG] pair/day/side completed lock hit -> skip {pair} {day} side={setup_side}"
+        )
         return None
 
     has_active_same_side = has_active_registry_signal_for_pair_day_side_fn(
-        pair, day, setup_side)
+        pair, day, setup_side
+    )
     print(
-        f"[FRESH DBG] has_active_registry_signal_for_pair_day_side={has_active_same_side}")
+        f"[FRESH DBG] has_active_registry_signal_for_pair_day_side={has_active_same_side}"
+    )
 
     if has_active_same_side:
         same_existing_side = (
@@ -477,7 +516,8 @@ def write_fresh_signal_after_strict_delete(
             or same_existing_status not in active_file_statuses
         ):
             print(
-                f"[FRESH DBG] active registry guard blocked fresh write for {pair} {day} side={setup_side}")
+                f"[FRESH DBG] active registry guard blocked fresh write for {pair} {day} side={setup_side}"
+            )
             return None
 
     signal_id = make_signal_id_from_setup_fn(pair, day, setup)
@@ -499,7 +539,8 @@ def write_fresh_signal_after_strict_delete(
 
     if already_completed_exact or already_completed_same_prices:
         print(
-            f"[FRESH DBG] setup already completed in registry -> skip fresh write: {signal_id}")
+            f"[FRESH DBG] setup already completed in registry -> skip fresh write: {signal_id}"
+        )
         return None
 
     print(f"[FRESH DBG] TERMINAL_FILLED_STATUSES={terminal_filled_statuses}")
@@ -545,6 +586,33 @@ def write_fresh_signal_after_strict_delete(
             reason=reason,
         )
         print("[FRESH DBG] strict cancel completed")
+
+        reg_after_cancel = load_live_registry_fn()
+        same_side_completed_after_cancel = False
+
+        for _, row in reg_after_cancel.items():
+            row_pair = str(row.get("pair", "")).strip()
+            row_day = str(row.get("day", "")).strip()
+            row_side = str(row.get("side", "")).strip().upper()
+            row_completed = bool(row.get("completed", False))
+            row_status = str(row.get("registry_status", "")).strip().upper()
+
+            if row_pair != pair:
+                continue
+            if row_day != str(day):
+                continue
+            if row_side != setup_side:
+                continue
+
+            if row_completed or row_status == "COMPLETED":
+                same_side_completed_after_cancel = True
+                break
+
+        if same_side_completed_after_cancel:
+            print(
+                f"[FRESH DBG] completed lock hit after strict cancel -> skip final write for {pair} {day} side={setup_side}"
+            )
+            return None
 
     else:
         print("[FRESH DBG] no active existing file branch, proceeding to final write")
