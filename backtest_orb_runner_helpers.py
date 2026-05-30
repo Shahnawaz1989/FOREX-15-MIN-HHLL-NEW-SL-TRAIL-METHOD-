@@ -123,6 +123,13 @@ def process_setup_candidate(engine, df, day_df, setup, last_exit_time=None):
         )
         return None
 
+    if engine._is_setup_in_hhll_disable_window(setup):
+        print(
+            f" -> {engine.pair} {side} setup detected in HH/LL disable window "
+            f"(half-process mode in live, skip in backtest)"
+        )
+        return None
+
     print(
         f" -> Chosen setup: side={side}, "
         f"picked_candle_time={setup.get('picked_candle_time')}, "

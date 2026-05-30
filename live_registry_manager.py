@@ -301,17 +301,25 @@ def is_setup_in_hhll_disable_window(setup: dict, disable_start_server, disable_e
     if not setup:
         return False
 
-    trigger_time = setup.get("trigger_time")
-    if trigger_time is None:
+    ref_time = setup.get("picked_candle_time")
+
+    if ref_time is None or str(ref_time).strip() == "":
+        ref_time = setup.get("trigger_time")
+
+    if ref_time is None or str(ref_time).strip() == "":
         return False
 
     try:
-        trigger_time = pd.to_datetime(trigger_time)
+        ref_time = pd.to_datetime(ref_time)
     except Exception:
         return False
 
-    t = trigger_time.time()
-    return disable_start_server <= t < disable_end_server
+    t = ref_time.time()
+
+    if disable_start_server <= disable_end_server:
+        return disable_start_server <= t < disable_end_server
+
+    return t >= disable_start_server or t < disable_end_server
 
 
 def parse_registry_ts(x):

@@ -2,6 +2,7 @@ from strategy_calculator import StrategyCalculator
 from gann_fetcher import GannFetcher
 from live_data_mt5 import fetch_live_1m
 from live_fund_manager import get_live_usable_fund
+from backtest_orb_runner_live_style import process_pair_day_live_style
 import os
 import pandas as pd
 import numpy as np
@@ -188,7 +189,7 @@ class BacktestEngine1HORB:
 
         # SERVER-time HH/LL disable window:
         # Detection allowed, but new order processing blocked in this window.
-        self.hhll_disable_start_server = time(12, 00)
+        self.hhll_disable_start_server = time(19, 00)
         self.hhll_disable_end_server = time(23, 45)
 
         # 🔹 Local Gann lookup load (JSON)
@@ -642,7 +643,7 @@ class BacktestEngine1HORB:
                 week_num, risk_percent = get_weekly_risk_percent(self, day)
                 day_risk_percent = risk_percent
 
-                trades = process_pair_day(self, day, pair, df)
+                trades = process_pair_day_live_style(self, day, pair, df)
 
                 for trade in trades:
                     day_trade_count += 1
