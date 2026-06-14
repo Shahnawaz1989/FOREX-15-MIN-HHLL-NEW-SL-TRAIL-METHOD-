@@ -90,64 +90,119 @@ def _find_nearest_sell_target(
     return {"target_key": key, "target_price": _round5(px)}
 
 
-def _is_15m_to_1h_positive(
-    engine,
-    candidate_atr: float,
-    breakout_time,
-    verbose: bool = False,
-) -> Dict:
-    h1 = getattr(engine, "h1_atr_df", pd.DataFrame())
-    if (
-        h1 is None
-        or h1.empty
-        or "time" not in h1.columns
-        or "atr" not in h1.columns
-    ):
-        _dbg(verbose, " -> H1 ATR data missing")
-        return {
-            "valid": False,
-            "h1_atr_raw": None,
-            "h1_atr_cmp": None,
-            "result_atr": None,
-            "candidate_atr": _round5(candidate_atr) if candidate_atr is not None else None,
-            "candidate_atr_cmp": None,
-            "atr_last_filter_enabled": False,
-            "atr_last_filter_valid": None,
-            "atr_last_filter_threshold": None,
-            "atr_last_filter_value": None,
-        }
+def _is_15m_to_1h_positive(self, breakout_time, candle_15m_atr, verbose=False):
+    import pandas as pd
 
-    xh1 = h1.copy()
-    xh1["time"] = pd.to_datetime(xh1["time"], errors="coerce")
-    xh1["atr"] = pd.to_numeric(xh1["atr"], errors="coerce")
+    result = {
+        "valid": False,
+        "h1_atr_raw": None,
+        "h1_atr_cmp": None,
+        "result_atr": None,
+        "candidate_atr": None,
+        "candidate_atr_cmp": None,
+        "atr_last_filter_enabled": False,
+        "atr_last_filter_valid": None,
+        "atr_last_filter_threshold": None,
+        "atr_last_filter_value": None,
+        "prev_h1_time": None,
+        "reason": None,
+    }
+
+    xh1 = getattr(self, "h1_atr_df", None)
+    if xh1 is None or len(xh1) == 0:
+        result["reason"] = "no_h1_atr_dataframe"
+        if verbose:
+            print(
+                f" -> ATR_CHECK | breakout_time={breakout_time} | no H1 ATR dataframe available")
+        return result
+
+    xh1 = xh1.copy()
+
+    time_col = None
+    if "time" in xh1.columns:
+        time_col = "time"
+    elif "datetime" in xh1.columns:
+        time_col = "datetime"
+    else:
+        result["reason"] = "h1_time_column_missing"
+        if verbose:
+            print(
+                f" -> ATR_CHECK | breakout_time={breakout_time} | H1 ATR dataframe has no time/datetime column")
+        return result
+
+    atr_col = None
+    if "atr" in xh1.columns:
+        atr_col = "atr"
+    elif "atr_mt5" in xh1.columns:
+        atr_col = "atr_mt5"
+    else:
+        result["reason"] = "h1_atr_column_missing"
+        if verbose:
+            print(
+                f" -> ATR_CHECK | breakout_time={breakout_time} | H1 ATR dataframe has no atr/atr_mt5 column")
+        return result
+
+    xh1[time_col] = pd.to_datetime(xh1[time_col], errors="coerce")
+    xh1[atr_col] = pd.to_numeric(xh1[atr_col], errors="coerce")
     xh1 = (
-        xh1.dropna(subset=["time", "atr"])
-        .sort_values("time")
+        xh1.dropna(subset=[time_col, atr_col])
+        .sort_values(time_col)
         .reset_index(drop=True)
     )
+
     if xh1.empty:
-        return {
-            "valid": False,
-            "h1_atr_raw": None,
-            "h1_atr_cmp": None,
-            "result_atr": None,
-            "candidate_atr": _round5(candidate_atr) if candidate_atr is not None else None,
-            "candidate_atr_cmp": None,
-            "atr_last_filter_enabled": False,
-            "atr_last_filter_valid": None,
-            "atr_last_filter_threshold": None,
-            "atr_last_filter_value": None,
-        }
+        result["reason"] = "h1_atr_dataframe_empty_after_cleanup"
+        if verbose:
+            print(
+                f" -> ATR_CHECK | breakout_time={breakout_time} | H1 ATR dataframe empty after cleanup")
+        return result
 
-    bt = pd.Timestamp(breakout_time)
-    eligible = xh1.loc[xh1["time"] <= bt]
-    h1_row = eligible.iloc[-1] if not eligible.empty else xh1.iloc[0]
+    bt = pd.to_datetime(breakout_time, errors="coerce")
+    if pd.isna(bt) or bt.year <= 1971:
+        result["reason"] = "invalid_breakout_time"
+        if verbose:
+            print(f" -> ATR_CHECK | invalid breakout_time={breakout_time}")
+        return result
 
-    h1_atr_raw = float(h1_row["atr"])
-    m15_atr_raw = float(candidate_atr)
+    try:
+        current_15m_atr = float(candle_15m_atr)
+    except Exception:
+        result["reason"] = "invalid_15m_atr"
+        if verbose:
+            print(
+                f" -> ATR_CHECK | breakout_time={bt} | invalid 15M ATR={candle_15m_atr}")
+        return result
 
-    h1_atr_cmp = round(h1_atr_raw * 100000, 0)
-    m15_atr_cmp = round(m15_atr_raw * 100000, 0)
+    result["candidate_atr"] = round(current_15m_atr, 5)
+    result["candidate_atr_cmp"] = round(current_15m_atr * 100000, 2)
+
+    current_h1_open = bt.floor("1h")
+
+    prev_candidates = xh1.loc[xh1[time_col] < current_h1_open]
+    if prev_candidates.empty:
+        result["reason"] = "no_previous_available_closed_h1_atr"
+        if verbose:
+            print(
+                f" -> ATR_CHECK | breakout_time={bt} | current_h1_open={current_h1_open} | no previous available closed H1 ATR"
+            )
+        return result
+
+    prev_row = prev_candidates.iloc[-1]
+    prev_time = pd.Timestamp(prev_row[time_col])
+
+    try:
+        prev_h1_atr = float(prev_row[atr_col])
+    except Exception:
+        result["prev_h1_time"] = prev_time
+        result["reason"] = "invalid_previous_h1_atr"
+        if verbose:
+            print(
+                f" -> ATR_CHECK | breakout_time={bt} | current_h1_open={current_h1_open} | used_prev_available_h1={prev_time} | invalid previous H1 ATR"
+            )
+        return result
+
+    h1_atr_cmp = round(prev_h1_atr * 100000, 2)
+    candidate_atr_cmp = round(current_15m_atr * 100000, 2)
 
     if h1_atr_cmp <= 150:
         result_atr_cmp = h1_atr_cmp / 2.5
@@ -155,48 +210,27 @@ def _is_15m_to_1h_positive(
         result_atr_cmp = h1_atr_cmp / 2.70
 
     result_atr_cmp = round(float(result_atr_cmp), 2)
-    base_ok = m15_atr_cmp > result_atr_cmp
+    compare_ok = candidate_atr_cmp > result_atr_cmp
 
-    last_filter_enabled = False
-    last_filter_value = None
-    last_filter_threshold = None
-    last_filter_ok = True
+    result["valid"] = compare_ok
+    result["h1_atr_raw"] = round(prev_h1_atr, 5)
+    result["h1_atr_cmp"] = h1_atr_cmp
+    result["result_atr"] = result_atr_cmp
+    result["candidate_atr"] = round(current_15m_atr, 5)
+    result["candidate_atr_cmp"] = candidate_atr_cmp
+    result["prev_h1_time"] = prev_time
+    result["reason"] = "passed" if compare_ok else "atr_compare_failed"
 
-    ok = base_ok
+    if verbose:
+        print(
+            f" -> ATR_CHECK | breakout_time={bt} | current_h1_open={current_h1_open} | "
+            f"used_prev_available_h1={prev_time} | h1_atr_raw={prev_h1_atr:.6f} | "
+            f"h1_atr_cmp={h1_atr_cmp:.2f} | h1_result_cmp={result_atr_cmp:.2f} | "
+            f"candidate_atr={current_15m_atr:.6f} | candidate_atr_cmp={candidate_atr_cmp:.2f} | "
+            f"pass={compare_ok}"
+        )
 
-    last_filter_value_str = f"{last_filter_value:.2f}" if last_filter_value is not None else "NA"
-    last_filter_threshold_str = f"{last_filter_threshold:.2f}" if last_filter_threshold is not None else "NA"
-
-    _dbg(
-        verbose,
-        (
-            " -> ATR_CHECK | "
-            f"time={bt} | "
-            f"H1_raw={h1_atr_raw:.5f} | "
-            f"H1_cmp={h1_atr_cmp:.0f} | "
-            f"H1_result_cmp={result_atr_cmp:.2f} | "
-            f"M15_candidate={m15_atr_raw:.5f} | "
-            f"M15_cmp={m15_atr_cmp:.0f} | "
-            f"LAST_FILTER_ENABLED={last_filter_enabled} | "
-            f"LAST_FILTER_VALUE={last_filter_value_str} | "
-            f"LAST_FILTER_THRESHOLD={last_filter_threshold_str} | "
-            f"LAST_FILTER_VALID={last_filter_ok} | "
-            f"valid={ok}"
-        ),
-    )
-
-    return {
-        "valid": ok,
-        "h1_atr_raw": round(h1_atr_raw, 5),
-        "h1_atr_cmp": float(h1_atr_cmp),
-        "result_atr": float(result_atr_cmp),
-        "candidate_atr": round(m15_atr_raw, 5),
-        "candidate_atr_cmp": float(m15_atr_cmp),
-        "atr_last_filter_enabled": bool(last_filter_enabled),
-        "atr_last_filter_valid": bool(last_filter_ok) if last_filter_enabled else None,
-        "atr_last_filter_threshold": float(last_filter_threshold) if last_filter_enabled else None,
-        "atr_last_filter_value": float(last_filter_value) if last_filter_enabled else None,
-    }
+    return result
 
 
 def _build_ll_buy_setup(
@@ -263,7 +297,7 @@ def _build_ll_buy_setup(
         return None
 
     atr_check = _is_15m_to_1h_positive(
-        engine, candidate_atr, breakout_time, verbose=hh_debug
+        engine, breakout_time, candidate_atr, verbose=hh_debug
     )
     if not atr_check["valid"]:
         if atr_check.get("atr_last_filter_enabled") and atr_check.get("atr_last_filter_valid") is False:
@@ -565,7 +599,7 @@ def _build_hh_sell_setup(
         return None
 
     atr_check = _is_15m_to_1h_positive(
-        engine, candidate_atr, breakout_time, verbose=hh_debug
+        engine, breakout_time, candidate_atr, verbose=hh_debug
     )
     if not atr_check["valid"]:
         if atr_check.get("atr_last_filter_enabled") and atr_check.get("atr_last_filter_valid") is False:
@@ -813,6 +847,7 @@ def build_setup_for_day(
     gap_info: Optional[Dict] = None,
 ):
     if day_df is None or day_df.empty:
+        print(" [SETUP DEBUG] day_df empty -> no setup")
         return {"chosen_setups": [], "all_setups": []}
 
     xdf = day_df.copy()
@@ -831,17 +866,65 @@ def build_setup_for_day(
         xdf.dropna(subset=["open", "high", "low", "close", "atr"])
         .reset_index(drop=True)
     )
+
     if xdf.empty:
+        print(" [SETUP DEBUG] xdf empty after numeric cleanup -> no setup")
         return {"chosen_setups": [], "all_setups": []}
+
+    print("\n[SETUP DEBUG] ----------------------------------------")
+    print(f"[SETUP DEBUG] pair={getattr(engine, 'pair', 'NA')}")
+    print(f"[SETUP DEBUG] rows={len(xdf)}")
+    print(f"[SETUP DEBUG] first_time={xdf.iloc[0]['time']}")
+    print(f"[SETUP DEBUG] last_time={xdf.iloc[-1]['time']}")
+    print("[SETUP DEBUG] last candles:")
+    print(xdf[["time", "open", "high", "low", "close", "atr"]].tail(
+        10).to_string(index=False))
 
     all_attempts: List[Dict] = []
 
     buy_setup = _build_ll_buy_setup(
-        engine, xdf, all_attempts=all_attempts, hh_debug=hh_debug, gap_info=gap_info
+        engine, xdf, all_attempts=all_attempts, hh_debug=True, gap_info=gap_info
     )
     sell_setup = _build_hh_sell_setup(
-        engine, xdf, all_attempts=all_attempts, hh_debug=hh_debug, gap_info=gap_info
+        engine, xdf, all_attempts=all_attempts, hh_debug=True, gap_info=gap_info
     )
+
+    buy_attempts = [a for a in all_attempts if str(
+        a.get("side", "")).upper() == "BUY"]
+    sell_attempts = [a for a in all_attempts if str(
+        a.get("side", "")).upper() == "SELL"]
+
+    if buy_setup:
+        print(
+            f"[SETUP DEBUG] BUY VALID | picked={buy_setup.get('picked_candle_time')} "
+            f"trigger={buy_setup.get('trigger_time')} "
+            f"entry={buy_setup.get('entry')} sl={buy_setup.get('sl')} tp={buy_setup.get('tp')}"
+        )
+    else:
+        if buy_attempts:
+            last = buy_attempts[-1]
+            print(
+                f"[SETUP DEBUG] BUY REJECTED | picked={last.get('picked_candle_time')} "
+                f"reason={last.get('reason')} extra={last}"
+            )
+        else:
+            print("[SETUP DEBUG] BUY REJECTED | no attempt recorded")
+
+    if sell_setup:
+        print(
+            f"[SETUP DEBUG] SELL VALID | picked={sell_setup.get('picked_candle_time')} "
+            f"trigger={sell_setup.get('trigger_time')} "
+            f"entry={sell_setup.get('entry')} sl={sell_setup.get('sl')} tp={sell_setup.get('tp')}"
+        )
+    else:
+        if sell_attempts:
+            last = sell_attempts[-1]
+            print(
+                f"[SETUP DEBUG] SELL REJECTED | picked={last.get('picked_candle_time')} "
+                f"reason={last.get('reason')} extra={last}"
+            )
+        else:
+            print("[SETUP DEBUG] SELL REJECTED | no attempt recorded")
 
     chosen_setups: List[Dict] = []
     if buy_setup:
@@ -851,12 +934,20 @@ def build_setup_for_day(
 
     chosen_setups.sort(key=lambda s: pd.Timestamp(s["trigger_time"]))
 
-    if buy_setup and sell_setup:
-        _dbg(
-            verbose,
-            f" -> Both setups found. BUY trigger={pd.Timestamp(buy_setup['trigger_time'])}, "
-            f"SELL trigger={pd.Timestamp(sell_setup['trigger_time'])}, returning BOTH",
-        )
+    print(f"[SETUP DEBUG] chosen_setups_count={len(chosen_setups)}")
+    if chosen_setups:
+        for s in chosen_setups:
+            print(
+                f"[SETUP DEBUG] CHOSEN | side={s.get('side')} "
+                f"trigger={s.get('trigger_time')} entry={s.get('entry')} "
+                f"sl={s.get('sl')} tp={s.get('tp')}"
+            )
+    else:
+        print("[SETUP DEBUG] no chosen setups")
+
+    print("[SETUP DEBUG] all_attempts:")
+    for a in all_attempts:
+        print(f"  -> {a}")
 
     return {
         "chosen_setups": chosen_setups,

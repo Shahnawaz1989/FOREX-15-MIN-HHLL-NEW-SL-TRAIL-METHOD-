@@ -14,28 +14,12 @@ from live_registry_file_sync import sync_registry_from_mt5_files_for_pair_day
 HEARTBEAT_FILE = r"C:\trading_bot\heartbeats\live_runner_heartbeat.json"
 
 PAIRS = [
-    "AUDCAD.ecn",
-    "AUDUSD.ecn",
-    "AUDCHF.ecn",
-    "CADCHF.ecn",
-    "EURAUD.ecn",
-    "EURCAD.ecn",
-    "EURCHF.ecn",
+
     "EURUSD.ecn",
-    "EURGBP.ecn",
-    "GBPAUD.ecn",
-    "GBPCAD.ecn",
-    "GBPCHF.ecn",
-    "GBPUSD.ecn",
-    "NZDCAD.ecn",
-    "NZDUSD.ecn",
-    "NZDCHF.ecn",
-    "USDCAD.ecn",
-    "USDCHF.ecn",
 
 ]
 
-INITIAL_FUND = 30.0
+INITIAL_FUND = 100.0
 INITIAL_RISK = 8.0
 DEFAULT_PAIR = PAIRS[0]
 LOOKBACK_DAYS = 30
