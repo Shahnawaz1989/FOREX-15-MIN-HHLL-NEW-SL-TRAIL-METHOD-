@@ -16,6 +16,27 @@ class StrategyCalculator:
       - Entry BUY_T1   -> Target = BUY_T15
       - Entry SELL_AT  -> Target = SELL_T1
       - Entry SELL_T1  -> Target = SELL_T15
+
+    LEVEL SEQUENCE:
+      BUY SIDE:
+        buy_at
+        middle
+        buy_super_middle
+        buy_t05
+        buy_t1
+        buy_t125
+        buy_t15
+        buy_t2
+
+      SELL SIDE:
+        sell_at
+        middle
+        sell_super_middle
+        sell_t05
+        sell_t1
+        sell_t125
+        sell_t15
+        sell_t2
     """
 
     @staticmethod
@@ -65,6 +86,9 @@ class StrategyCalculator:
 
     @staticmethod
     def _extract_levels(gann: Dict) -> Dict:
+        buy_at = float(gann["buy_at"])
+        sell_at = float(gann["sell_at"])
+
         buy_t1 = float(gann["buy_t1"]) if "buy_t1" in gann else float(
             gann["buy_targets"][0])
         buy_t2 = float(gann["buy_t2"]) if "buy_t2" in gann else float(
@@ -75,26 +99,78 @@ class StrategyCalculator:
         sell_t2 = float(gann["sell_t2"]) if "sell_t2" in gann else float(
             gann["sell_targets"][1])
 
-        buy_at = float(gann["buy_at"])
-        sell_at = float(gann["sell_at"])
+        middle = float(gann["middle"]) if "middle" in gann else round(
+            (buy_at + sell_at) / 2.0, 5)
 
-        buy_t05 = round((buy_at + buy_t1) / 2.0, 5)
-        sell_t05 = round((sell_at + sell_t1) / 2.0, 5)
+        buy_super_middle = (
+            float(gann["buy_super_middle"])
+            if "buy_super_middle" in gann
+            else round((buy_at + middle) / 2.0, 5)
+        )
 
-        buy_t15 = round((buy_t1 + buy_t2) / 2.0, 5)
-        sell_t15 = round((sell_t1 + sell_t2) / 2.0, 5)
+        sell_super_middle = (
+            float(gann["sell_super_middle"])
+            if "sell_super_middle" in gann
+            else round((sell_at + middle) / 2.0, 5)
+        )
+
+        buy_t05 = (
+            float(gann["buy_t05"])
+            if "buy_t05" in gann
+            else round((buy_at + buy_t1) / 2.0, 5)
+        )
+
+        sell_t05 = (
+            float(gann["sell_t05"])
+            if "sell_t05" in gann
+            else round((sell_at + sell_t1) / 2.0, 5)
+        )
+
+        buy_t15 = (
+            float(gann["buy_t15"])
+            if "buy_t15" in gann
+            else round((buy_t1 + buy_t2) / 2.0, 5)
+        )
+
+        sell_t15 = (
+            float(gann["sell_t15"])
+            if "sell_t15" in gann
+            else round((sell_t1 + sell_t2) / 2.0, 5)
+        )
+
+        buy_t125 = (
+            float(gann["buy_t125"])
+            if "buy_t125" in gann
+            else round((buy_t1 + buy_t15) / 2.0, 5)
+        )
+
+        sell_t125 = (
+            float(gann["sell_t125"])
+            if "sell_t125" in gann
+            else round((sell_t1 + sell_t15) / 2.0, 5)
+        )
+
+        buy_sl = float(gann["buy_sl"]) if "buy_sl" in gann else sell_at
+        sell_sl = float(gann["sell_sl"]) if "sell_sl" in gann else buy_at
 
         return {
             "buy_at": buy_at,
+            "middle": middle,
+            "buy_super_middle": buy_super_middle,
             "buy_t05": buy_t05,
             "buy_t1": buy_t1,
-            "buy_t2": buy_t2,
+            "buy_t125": buy_t125,
             "buy_t15": buy_t15,
+            "buy_t2": buy_t2,
+            "buy_sl": buy_sl,
             "sell_at": sell_at,
+            "sell_super_middle": sell_super_middle,
             "sell_t05": sell_t05,
             "sell_t1": sell_t1,
-            "sell_t2": sell_t2,
+            "sell_t125": sell_t125,
             "sell_t15": sell_t15,
+            "sell_t2": sell_t2,
+            "sell_sl": sell_sl,
         }
 
     @staticmethod

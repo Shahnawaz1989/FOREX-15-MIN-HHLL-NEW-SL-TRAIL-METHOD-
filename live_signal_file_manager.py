@@ -93,10 +93,6 @@ def build_live_cancel_payload(
 def build_live_place_payload(
     fmt_live_ts_fn,
     make_signal_id_from_setup_fn,
-    is_signal_completed_in_registry_fn,
-    is_same_completed_trade_prices_fn,
-    load_live_registry_fn,
-    save_live_registry_fn,
     live_signal_expiry_server_fn,
     pair: str,
     day,
@@ -104,97 +100,29 @@ def build_live_place_payload(
     action: str = "PLACE",
     max_spread_points=25,
     max_slippage_points=15,
+    is_signal_completed_in_registry_fn=None,
+    is_same_completed_trade_prices_fn=None,
+    load_live_registry_fn=None,
+    save_live_registry_fn=None,
 ):
-    trigger_time = fmt_live_ts_fn(setup.get("trigger_time"))
-    picked_candle_time = fmt_live_ts_fn(setup.get("picked_candle_time"))
-    breakout_candle_time = fmt_live_ts_fn(setup.get("breakout_candle_time"))
-
-    entry = round(float(setup["entry"]), 5)
-    sl = round(float(setup["sl"]), 5)
-    tp = round(float(setup["tp"]), 5)
-    atr = round(float(setup.get("atr", 0.0)), 5)
-    lot = round(float(setup["lot_size"]), 2)
-    side = str(setup.get("side", "")).upper().strip()
-
-    signal_id = make_signal_id_from_setup_fn(pair, day, setup)
-
-    already_completed_exact = is_signal_completed_in_registry_fn(signal_id)
-    already_completed_same_prices = is_same_completed_trade_prices_fn(
-        pair=pair,
-        day=day,
-        side=side,
-        entry=entry,
-        sl=sl,
-        tp=tp,
-    )
-
-    if already_completed_exact or already_completed_same_prices:
-        print(f" -> Registry says completed, skip payload build: {signal_id}")
-        return None
-
-    reg = load_live_registry_fn()
-    row = reg.get(signal_id, {})
-
-    row_completed = bool(row.get("completed", False))
-    row_status = str(row.get("registry_status", "")).upper().strip()
-    row_exit_result = str(row.get("exit_result", "")).strip().lower()
-
-    if (
-        row_completed
-        or row_status == "COMPLETED"
-        or row_exit_result in {"tp", "sl", "sl_lock10", "session_exit"}
-    ):
-        print(
-            f" -> Existing registry row already finalized, skip payload build: {signal_id}"
-        )
-        return None
-
-    prev_row = reg.get(signal_id, {})
-    if (
-        bool(prev_row.get("completed", False))
-        or str(prev_row.get("registry_status", "")).upper().strip() == "COMPLETED"
-    ):
-        print(f" -> Refusing to overwrite completed row: {signal_id}")
-        return None
-
-    reg[signal_id] = {
-        "signal_id": signal_id,
-        "pair": pair,
-        "day": str(day),
-        "side": side,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "atr": atr,
-        "completed": False,
-        "trigger_time": trigger_time,
-        "picked_candle_time": picked_candle_time,
-        "breakout_candle_time": breakout_candle_time,
-        "registry_status": row_status if row_status and row_status != "COMPLETED" else "GENERATED",
-        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-    save_live_registry_fn(reg)
-    print(f" -> Registry signal added/updated: {signal_id}")
-
     return {
         "action": action,
-        "signal_id": signal_id,
+        "signal_id": make_signal_id_from_setup_fn(pair, day, setup),
         "symbol": pair,
-        "side": side,
-        "expiry_server": live_signal_expiry_server_fn(day).strftime("%Y-%m-%d %H:%M:%S"),
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "lot": lot,
-        "entry_mode": str(setup.get("entry_mode", "")),
-        "atr": atr,
-        "trigger_time": trigger_time,
-        "picked_candle_time": picked_candle_time,
-        "breakout_candle_time": breakout_candle_time,
+        "side": str(setup.get("side", "")).upper().strip(),
+        "expiry_server": live_signal_expiry_server_fn(day),
+        "entry": f"{float(setup.get('entry', 0.0)):.5f}",
+        "sl": f"{float(setup.get('sl', 0.0)):.5f}",
+        "tp": f"{float(setup.get('tp', 0.0)):.5f}",
+        "lot": f"{float(setup.get('lot_size', 0.0)):.2f}",
+        "entry_mode": str(setup.get("entry_mode", "STOP")),
+        "atr": f"{float(setup.get('atr', 0.0)):.5f}",
+        "trigger_time": fmt_live_ts_fn(setup.get("trigger_time")),
+        "picked_candle_time": fmt_live_ts_fn(setup.get("picked_candle_time")),
+        "breakout_candle_time": fmt_live_ts_fn(setup.get("breakout_candle_time")),
         "status": "NEW",
-        "max_spread_points": int(max_spread_points),
-        "max_slippage_points": int(max_slippage_points),
+        "max_spread_points": str(max_spread_points),
+        "max_slippage_points": str(max_slippage_points),
     }
 
 
@@ -371,7 +299,6 @@ def write_live_signal_file(
 def cancel_existing_signal_strict(
     build_live_cancel_payload_fn,
     write_live_signal_file_fn,
-    mark_signal_non_completed_in_registry_fn,
     terminal_filled_statuses,
     pair: str,
     day,
@@ -381,60 +308,36 @@ def cancel_existing_signal_strict(
     max_slippage_points: int,
     reason: str = "CANCELLEDNEWHHLL",
     pre_cancel_finalize_fn=None,
+    mark_signal_non_completed_in_registry_fn=None,
 ):
-    if existing is None:
-        try:
-            if os.path.exists(signal_file):
-                os.remove(signal_file)
-                print(
-                    f"  -> Deleted file (no existing payload): {signal_file}")
-        except Exception as e:
-            print(f"  -> Failed deleting file {signal_file}: {e}")
-        return
+    if not existing:
+        return None
 
     existing_status = str(existing.get("status", "")).upper().strip()
     if existing_status in terminal_filled_statuses:
         print(
-            f"  -> Existing filled status {existing_status}, skip strict cancel: {signal_file}"
-        )
-        return
+            f"  -> Skip cancel, terminal filled status in file: {existing_status}")
+        return None
 
-    old_signal_id = str(existing.get("signal_id", "")).strip()
-
-    if pre_cancel_finalize_fn is not None and old_signal_id:
+    if callable(pre_cancel_finalize_fn):
         try:
-            finalized = bool(pre_cancel_finalize_fn(old_signal_id))
-            if finalized:
-                print(
-                    f"  -> Existing signal finalized before cancel, skip CANCEL: {old_signal_id}"
-                )
-                return
+            pre_cancel_finalize_fn(existing.get("signal_id", ""))
         except Exception as e:
-            print(
-                f"  -> pre_cancel_finalize_fn failed for {old_signal_id}: {e}")
+            print(f"  -> pre-cancel finalize skipped: {e}")
 
-    cancel_payload = build_live_cancel_payload_fn(
+    payload = build_live_cancel_payload_fn(
         pair=pair,
         day=day,
-        existing_signal_id=old_signal_id,
-        existing_side=str(existing.get("side", "")).strip().upper(),
+        existing_signal_id=existing.get("signal_id", ""),
+        existing_side=existing.get("side", ""),
         max_spread_points=max_spread_points,
         max_slippage_points=max_slippage_points,
     )
-    write_live_signal_file_fn(signal_file, cancel_payload)
-
-    if old_signal_id:
-        mark_signal_non_completed_in_registry_fn(old_signal_id, reason)
-
-    print(f"  -> Strict cancel file kept for EA processing: {signal_file}")
+    payload["status"] = reason
+    return write_live_signal_file_fn(signal_file, payload)
 
 
 def write_fresh_signal_after_strict_delete(
-    load_live_registry_fn,
-    has_active_registry_signal_for_pair_day_side_fn,
-    make_signal_id_from_setup_fn,
-    is_signal_completed_in_registry_fn,
-    is_same_completed_trade_prices_fn,
     build_live_place_payload_fn,
     is_same_live_payload_fn,
     cancel_existing_signal_strict_fn,
@@ -450,104 +353,12 @@ def write_fresh_signal_after_strict_delete(
     max_spread_points: int,
     max_slippage_points: int,
     reason: str = "CANCELLEDNEWHHLL",
+    load_live_registry_fn=None,
+    has_active_registry_signal_for_pair_day_side_fn=None,
+    make_signal_id_from_setup_fn=None,
+    is_signal_completed_in_registry_fn=None,
+    is_same_completed_trade_prices_fn=None,
 ):
-    print(f"\n[FRESH DBG] ENTER pair={pair} file={signal_file}")
-    print(f"[FRESH DBG] day={day}")
-    print(f"[FRESH DBG] existing_status(raw)={existing_status}")
-    print(f"[FRESH DBG] existing={existing}")
-    print(f"[FRESH DBG] setup={setup}")
-
-    existing_status = str(existing_status or "").upper().strip()
-    setup_side = str(setup.get("side", "")).upper().strip()
-
-    print(f"[FRESH DBG] existing_status(norm)={existing_status}")
-    print(f"[FRESH DBG] setup_side={setup_side}")
-
-    reg = load_live_registry_fn()
-    day_str = str(day)
-    same_side_completed = False
-
-    for _, row in reg.items():
-        row_pair = str(row.get("pair", "")).strip()
-        row_day = str(row.get("day", "")).strip()
-        row_side = str(row.get("side", "")).strip().upper()
-        row_completed = bool(row.get("completed", False))
-        row_status = str(row.get("registry_status", "")).strip().upper()
-
-        if row_pair != pair:
-            continue
-        if row_day != day_str:
-            continue
-        if row_side != setup_side:
-            continue
-
-        if row_completed or row_status == "COMPLETED":
-            same_side_completed = True
-            break
-
-    if same_side_completed:
-        print(
-            f"[FRESH DBG] pair/day/side completed lock hit -> skip {pair} {day} side={setup_side}"
-        )
-        return None
-
-    has_active_same_side = has_active_registry_signal_for_pair_day_side_fn(
-        pair, day, setup_side
-    )
-    print(
-        f"[FRESH DBG] has_active_registry_signal_for_pair_day_side={has_active_same_side}"
-    )
-
-    if has_active_same_side:
-        same_existing_side = (
-            str(existing.get("side", "")).upper().strip() if existing else ""
-        )
-        same_existing_status = (
-            str(existing.get("status", "")).upper().strip() if existing else ""
-        )
-
-        print(f"[FRESH DBG] same_existing_side={same_existing_side}")
-        print(f"[FRESH DBG] same_existing_status={same_existing_status}")
-        print(f"[FRESH DBG] ACTIVE_FILE_STATUSES={active_file_statuses}")
-
-        if (
-            not existing
-            or same_existing_side != setup_side
-            or same_existing_status not in active_file_statuses
-        ):
-            print(
-                f"[FRESH DBG] active registry guard blocked fresh write for {pair} {day} side={setup_side}"
-            )
-            return None
-
-    signal_id = make_signal_id_from_setup_fn(pair, day, setup)
-    print(f"[FRESH DBG] signal_id={signal_id}")
-
-    already_completed_exact = is_signal_completed_in_registry_fn(signal_id)
-    already_completed_same_prices = is_same_completed_trade_prices_fn(
-        pair=pair,
-        day=day,
-        side=setup_side,
-        entry=float(setup.get("entry", 0.0)),
-        sl=float(setup.get("sl", 0.0)),
-        tp=float(setup.get("tp", 0.0)),
-    )
-
-    print(f"[FRESH DBG] already_completed_exact={already_completed_exact}")
-    print(
-        f"[FRESH DBG] already_completed_same_prices={already_completed_same_prices}")
-
-    if already_completed_exact or already_completed_same_prices:
-        print(
-            f"[FRESH DBG] setup already completed in registry -> skip fresh write: {signal_id}"
-        )
-        return None
-
-    print(f"[FRESH DBG] TERMINAL_FILLED_STATUSES={terminal_filled_statuses}")
-    if existing_status in terminal_filled_statuses:
-        print("[FRESH DBG] existing trade already filled/managed -> no overwrite")
-        return None
-
     payload = build_live_place_payload_fn(
         pair=pair,
         day=day,
@@ -557,25 +368,16 @@ def write_fresh_signal_after_strict_delete(
         max_slippage_points=max_slippage_points,
     )
 
-    print(f"[FRESH DBG] payload from _build_live_place_payload={payload}")
+    if existing and is_same_live_payload_fn(existing, payload):
+        print(f"  -> Existing file already matches fresh setup for {pair}")
+        return payload
 
-    if payload is None:
-        print("[FRESH DBG] payload is None -> no live file write")
+    if existing and existing_status in terminal_filled_statuses:
+        print(
+            f"  -> Existing terminal filled file status blocks rewrite: {existing_status}")
         return None
 
-    if existing is not None and existing_status in active_file_statuses:
-        same_payload = is_same_live_payload_fn(existing, payload)
-        print(f"[FRESH DBG] existing active file detected")
-        print(f"[FRESH DBG] existing_status in ACTIVE_FILE_STATUSES -> True")
-        print(f"[FRESH DBG] same_payload={same_payload}")
-        print(f"[FRESH DBG] existing payload={existing}")
-        print(f"[FRESH DBG] new payload={payload}")
-
-        if same_payload:
-            print("[FRESH DBG] chosen setup unchanged (prices/lot/mode) -> no rewrite")
-            return payload
-
-        print("[FRESH DBG] chosen setup changed materially -> STRICT DELETE flow")
+    if existing and existing_status in active_file_statuses:
         cancel_existing_signal_strict_fn(
             pair=pair,
             day=day,
@@ -585,40 +387,5 @@ def write_fresh_signal_after_strict_delete(
             max_slippage_points=max_slippage_points,
             reason=reason,
         )
-        print("[FRESH DBG] strict cancel completed")
 
-        reg_after_cancel = load_live_registry_fn()
-        same_side_completed_after_cancel = False
-
-        for _, row in reg_after_cancel.items():
-            row_pair = str(row.get("pair", "")).strip()
-            row_day = str(row.get("day", "")).strip()
-            row_side = str(row.get("side", "")).strip().upper()
-            row_completed = bool(row.get("completed", False))
-            row_status = str(row.get("registry_status", "")).strip().upper()
-
-            if row_pair != pair:
-                continue
-            if row_day != str(day):
-                continue
-            if row_side != setup_side:
-                continue
-
-            if row_completed or row_status == "COMPLETED":
-                same_side_completed_after_cancel = True
-                break
-
-        if same_side_completed_after_cancel:
-            print(
-                f"[FRESH DBG] completed lock hit after strict cancel -> skip final write for {pair} {day} side={setup_side}"
-            )
-            return None
-
-    else:
-        print("[FRESH DBG] no active existing file branch, proceeding to final write")
-
-    print(f"[FRESH DBG] calling _write_live_signal_file for {signal_file}")
-    write_live_signal_file_fn(signal_file, payload)
-    print(f"[FRESH DBG] final write done for {signal_file}")
-
-    return payload
+    return write_live_signal_file_fn(signal_file, payload)

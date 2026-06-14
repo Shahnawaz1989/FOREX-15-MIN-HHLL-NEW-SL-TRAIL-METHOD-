@@ -16,26 +16,14 @@ def is_existing_from_old_day(existing_payload, current_day):
 
 
 def choose_live_setup_for_day(engine, day_df: pd.DataFrame, fund: float, risk_percent: float):
-    high_setup = engine._build_high_setup_for_day(day_df, fund, risk_percent)
-    low_setup = engine._build_low_setup_for_day(day_df, fund, risk_percent)
-
-    candidates = []
-    if high_setup:
-        candidates.append(high_setup)
-    if low_setup:
-        candidates.append(low_setup)
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda s: s["trigger_time"])
-    return candidates[-1]
+    return engine._build_setup_for_day(day_df, fund, risk_percent)
 
 
 def evaluate_setup_state(engine, pair: str, day, side: str, setup: Dict):
     result = {
         "setup": setup,
         "suppressed": False,
+        "suppression_reason": "",
         "blocked_by_disable_window": False,
         "replace_old_active": False,
         "active_id": None,
@@ -44,46 +32,60 @@ def evaluate_setup_state(engine, pair: str, day, side: str, setup: Dict):
 
     if not setup:
         result["suppressed"] = True
+        result["suppression_reason"] = "NO_SETUP"
         return result
 
-    if engine._is_setup_in_hhll_disable_window(setup):
-        print(
-            f"  -> {pair} {day} {side} setup detected in HH/LL disable window (half-process mode)")
-        result["blocked_by_disable_window"] = True
+    existing_order = None
+    try:
+        existing_order = engine._find_mt5_pending_order_for_setup(
+            pair=pair, setup=setup
+        )
+    except Exception as e:
+        print(f"  -> MT5 pending lookup failed for {pair} {side}: {e}")
 
-    if engine._is_same_completed_trade_prices(
-        pair=pair,
-        day=day,
-        side=side,
-        entry=float(setup.get("entry", 0.0)),
-        sl=float(setup.get("sl", 0.0)),
-        tp=float(setup.get("tp", 0.0)),
-    ):
+    existing_position = None
+    try:
+        existing_position = engine._find_mt5_open_position_for_setup(
+            pair=pair, setup=setup
+        )
+    except Exception as e:
+        print(f"  -> MT5 open-position lookup failed for {pair} {side}: {e}")
+
+    already_closed = False
+    try:
+        already_closed = bool(
+            engine._has_mt5_closed_trade_for_setup(
+                pair=pair, day=day, setup=setup
+            )
+        )
+    except Exception as e:
+        print(f"  -> MT5 history lookup failed for {pair} {side}: {e}")
+
+    if already_closed:
         print(
-            f"  -> {pair} {day} {side} suppressed: same completed setup already closed")
+            f"  -> {pair} {day} {side} suppressed: same setup already closed in MT5 history"
+        )
         result["suppressed"] = True
+        result["suppression_reason"] = "MT5_HISTORY_CLOSED"
         return result
 
-    active_id, active_row = engine._get_active_registry_signal_for_pair_day_side(
-        pair, day, side)
-    result["active_id"] = active_id
-    result["active_row"] = active_row
-
-    if active_row:
-        if engine._is_same_setup_signature(active_row, setup):
-            print(
-                f"  -> {pair} {day} {side} suppressed: same active setup already exists")
-            result["suppressed"] = True
-            return result
-        if not engine._is_newer_setup_than_row(active_row, setup):
-            print(
-                f"  -> {pair} {day} {side} suppressed: active setup is newer/equal")
-            result["suppressed"] = True
-            return result
-
+    if existing_position:
         print(
-            f"  -> {pair} {day} {side} new HH/LL detected, replacing old active setup {active_id}")
-        result["replace_old_active"] = True
+            f"  -> {pair} {day} {side} suppressed: matching MT5 open position exists"
+        )
+        result["suppressed"] = True
+        result["suppression_reason"] = "MT5_OPEN_POSITION"
+        result["active_row"] = existing_position
+        return result
+
+    if existing_order:
+        print(
+            f"  -> {pair} {day} {side} suppressed: matching MT5 pending order exists"
+        )
+        result["suppressed"] = True
+        result["suppression_reason"] = "MT5_PENDING_ORDER"
+        result["active_row"] = existing_order
+        return result
 
     return result
 
@@ -105,9 +107,11 @@ def generate_live_dual_signals_for_latest_day(
     df = df.sort_values("time").reset_index(drop=True)
 
     if "atr" not in df.columns:
-        df = engine._add_atr_column(df)
-
-    engine._reconcile_open_registry_signals_with_market_data(pair=pair, df=df)
+        if hasattr(engine, "_add_atr_column"):
+            df = engine._add_atr_column(df)
+        else:
+            raise ValueError(
+                "df_15m must contain atr column or engine must provide _add_atr_column")
 
     day = df["time"].dt.date.max()
     day_df = df[df["time"].dt.date == day].copy()
@@ -129,18 +133,22 @@ def generate_live_dual_signals_for_latest_day(
 
     if is_existing_from_old_day(existing_buy, day):
         print(
-            f"  -> Existing BUY file belongs to old day, treating as stale: {buy_file}")
+            f"  -> Existing BUY file belongs to old day, treating as stale: {buy_file}"
+        )
         existing_buy = None
 
     if is_existing_from_old_day(existing_sell, day):
         print(
-            f"  -> Existing SELL file belongs to old day, treating as stale: {sell_file}")
+            f"  -> Existing SELL file belongs to old day, treating as stale: {sell_file}"
+        )
         existing_sell = None
 
-    existing_buy_status = str(existing_buy.get(
-        "status", "")).upper() if existing_buy else ""
-    existing_sell_status = str(existing_sell.get(
-        "status", "")).upper() if existing_sell else ""
+    existing_buy_status = (
+        str(existing_buy.get("status", "")).upper() if existing_buy else ""
+    )
+    existing_sell_status = (
+        str(existing_sell.get("status", "")).upper() if existing_sell else ""
+    )
 
     if day_df.empty or not engine._validate_day(day_df):
         print("  -> Day invalid")
@@ -173,53 +181,70 @@ def generate_live_dual_signals_for_latest_day(
     print(f"  -> Live sizing fund selected = {fund:.2f}")
     risk_percent = engine.base_risk_percent
 
-    high_setup = engine._build_high_setup_for_day(day_df, fund, risk_percent)
-    low_setup = engine._build_low_setup_for_day(day_df, fund, risk_percent)
+    setup = engine._build_setup_for_day(day_df, fund, risk_percent)
 
-    buy_state = evaluate_setup_state(engine, pair, day, "B", low_setup)
-    sell_state = evaluate_setup_state(engine, pair, day, "S", high_setup)
+    buy_setup = None
+    sell_setup = None
 
-    buy_setup = None if buy_state["suppressed"] else buy_state["setup"]
-    sell_setup = None if sell_state["suppressed"] else sell_state["setup"]
+    buy_state = {
+        "setup": None,
+        "suppressed": True,
+        "suppression_reason": "NO_SETUP",
+        "blocked_by_disable_window": False,
+        "replace_old_active": False,
+        "active_id": None,
+        "active_row": None,
+    }
+    sell_state = {
+        "setup": None,
+        "suppressed": True,
+        "suppression_reason": "NO_SETUP",
+        "blocked_by_disable_window": False,
+        "replace_old_active": False,
+        "active_id": None,
+        "active_row": None,
+    }
 
-    reg = engine._load_live_registry()
-    day_str = str(day)
+    if setup:
+        side = str(setup.get("side", "")).upper().strip()
 
-    buy_completed = False
-    sell_completed = False
+        if side in {"BUY", "B"}:
+            buy_state = evaluate_setup_state(engine, pair, day, "B", setup)
+            buy_setup = None if buy_state["suppressed"] else buy_state["setup"]
 
-    for _, row in reg.items():
-        row_pair = str(row.get("pair", "")).strip()
-        row_day = str(row.get("day", "")).strip()
-        row_side = str(row.get("side", "")).strip().upper()
-        row_completed = bool(row.get("completed", False))
-        row_status = str(row.get("registry_status", "")).strip().upper()
-
-        if row_pair != pair or row_day != day_str:
-            continue
-
-        if row_side == "B" and (row_completed or row_status == "COMPLETED"):
-            buy_completed = True
-
-        if row_side == "S" and (row_completed or row_status == "COMPLETED"):
-            sell_completed = True
-
-    if buy_completed:
-        print(f"  -> {pair} {day} BUY already completed, suppress BUY export")
-        buy_setup = None
-
-    if sell_completed:
-        print(f"  -> {pair} {day} SELL already completed, suppress SELL export")
-        sell_setup = None
+        elif side in {"SELL", "S"}:
+            sell_state = evaluate_setup_state(engine, pair, day, "S", setup)
+            sell_setup = None if sell_state["suppressed"] else sell_state["setup"]
 
     buy_payload = None
     sell_payload = None
 
     if buy_setup:
-        if buy_state["blocked_by_disable_window"]:
+        print(f"[GEN DBG] {pair} BUY setup = {buy_setup}")
+        buy_payload = engine._write_fresh_signal_after_strict_delete(
+            pair=pair,
+            day=day,
+            signal_file=buy_file,
+            setup=buy_setup,
+            existing=existing_buy,
+            existing_status=existing_buy_status,
+            max_spread_points=max_spread_points,
+            max_slippage_points=max_slippage_points,
+            reason="CANCELLEDNEWHHLL",
+        )
+        print(f"[GEN DBG] {pair} BUY payload returned = {buy_payload}")
+    else:
+        if buy_state["suppressed"] and buy_state.get("suppression_reason") in {
+            "MT5_HISTORY_CLOSED",
+            "MT5_OPEN_POSITION",
+            "MT5_PENDING_ORDER",
+        }:
             print(
-                f"  -> {pair} BUY half-process: cancel old pending only if newer HH/LL replacement confirmed, no new setup write")
-            if buy_state["replace_old_active"] and existing_buy_status not in terminal_filled_statuses:
+                f"  -> {pair} BUY: setup suppressed by {buy_state['suppression_reason']}, skip cancel/write"
+            )
+        else:
+            print(f"  -> {pair} BUY: no setup")
+            if existing_buy_status not in terminal_filled_statuses:
                 engine._cancel_existing_signal_strict(
                     pair=pair,
                     day=day,
@@ -229,41 +254,33 @@ def generate_live_dual_signals_for_latest_day(
                     max_slippage_points=max_slippage_points,
                     reason="CANCELLEDNEWHHLL",
                 )
-            else:
-                print(
-                    f"  -> {pair} BUY half-process skipped cancel: no confirmed older active replacement")
-        else:
-            print(f"[GEN DBG] {pair} BUY setup = {buy_setup}")
-            buy_payload = engine._write_fresh_signal_after_strict_delete(
-                pair=pair,
-                day=day,
-                signal_file=buy_file,
-                setup=buy_setup,
-                existing=existing_buy,
-                existing_status=existing_buy_status,
-                max_spread_points=max_spread_points,
-                max_slippage_points=max_slippage_points,
-                reason="CANCELLEDNEWHHLL",
-            )
-            print(f"[GEN DBG] {pair} BUY payload returned = {buy_payload}")
-    else:
-        print(f"  -> {pair} BUY: no setup")
-        if existing_buy_status not in terminal_filled_statuses:
-            engine._cancel_existing_signal_strict(
-                pair=pair,
-                day=day,
-                signal_file=buy_file,
-                existing=existing_buy,
-                max_spread_points=max_spread_points,
-                max_slippage_points=max_slippage_points,
-                reason="CANCELLEDNEWHHLL",
-            )
 
     if sell_setup:
-        if sell_state["blocked_by_disable_window"]:
+        print(f"[GEN DBG] {pair} SELL setup = {sell_setup}")
+        sell_payload = engine._write_fresh_signal_after_strict_delete(
+            pair=pair,
+            day=day,
+            signal_file=sell_file,
+            setup=sell_setup,
+            existing=existing_sell,
+            existing_status=existing_sell_status,
+            max_spread_points=max_spread_points,
+            max_slippage_points=max_slippage_points,
+            reason="CANCELLEDNEWHHLL",
+        )
+        print(f"[GEN DBG] {pair} SELL payload returned = {sell_payload}")
+    else:
+        if sell_state["suppressed"] and sell_state.get("suppression_reason") in {
+            "MT5_HISTORY_CLOSED",
+            "MT5_OPEN_POSITION",
+            "MT5_PENDING_ORDER",
+        }:
             print(
-                f"  -> {pair} SELL half-process: cancel old pending only if newer HH/LL replacement confirmed, no new setup write")
-            if sell_state["replace_old_active"] and existing_sell_status not in terminal_filled_statuses:
+                f"  -> {pair} SELL: setup suppressed by {sell_state['suppression_reason']}, skip cancel/write"
+            )
+        else:
+            print(f"  -> {pair} SELL: no setup")
+            if existing_sell_status not in terminal_filled_statuses:
                 engine._cancel_existing_signal_strict(
                     pair=pair,
                     day=day,
@@ -273,34 +290,5 @@ def generate_live_dual_signals_for_latest_day(
                     max_slippage_points=max_slippage_points,
                     reason="CANCELLEDNEWHHLL",
                 )
-            else:
-                print(
-                    f"  -> {pair} SELL half-process skipped cancel: no confirmed older active replacement")
-        else:
-            print(f"[GEN DBG] {pair} SELL setup = {sell_setup}")
-            sell_payload = engine._write_fresh_signal_after_strict_delete(
-                pair=pair,
-                day=day,
-                signal_file=sell_file,
-                setup=sell_setup,
-                existing=existing_sell,
-                existing_status=existing_sell_status,
-                max_spread_points=max_spread_points,
-                max_slippage_points=max_slippage_points,
-                reason="CANCELLEDNEWHHLL",
-            )
-            print(f"[GEN DBG] {pair} SELL payload returned = {sell_payload}")
-    else:
-        print(f"  -> {pair} SELL: no setup")
-        if existing_sell_status not in terminal_filled_statuses:
-            engine._cancel_existing_signal_strict(
-                pair=pair,
-                day=day,
-                signal_file=sell_file,
-                existing=existing_sell,
-                max_spread_points=max_spread_points,
-                max_slippage_points=max_slippage_points,
-                reason="CANCELLEDNEWHHLL",
-            )
 
     return {"buy": buy_payload, "sell": sell_payload}

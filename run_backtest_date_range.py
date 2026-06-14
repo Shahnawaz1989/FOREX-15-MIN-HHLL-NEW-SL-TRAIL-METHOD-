@@ -1,5 +1,9 @@
+# python run_backtest_date_range.py
 import os
+import io
+import re
 from datetime import datetime, timedelta
+from contextlib import redirect_stdout
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -7,36 +11,83 @@ import pandas as pd
 from backtest_engine_1h_orb import BacktestEngine1HORB
 
 
-PAIRS = [
-    # "AUDCAD.ecn",
-    # "AUDUSD.ecn",
-    # "AUDCHF.ecn",
-    # "CADCHF.ecn",
-    # "EURAUD.ecn",
-    # "EURCAD.ecn",
-    # "EURCHF.ecn",
+TOTAL_PAIRS_LIST = [
+    "AUDCAD.ecn",
+    "AUDUSD.ecn",
+    "AUDCHF.ecn",
+    "CADCHF.ecn",
+    "EURAUD.ecn",
+    "EURCAD.ecn",
+    "EURCHF.ecn",
     "EURUSD.ecn",
-    # "EURGBP.ecn",
-    # "GBPAUD.ecn",
-    # "GBPCAD.ecn",
-    # "GBPCHF.ecn",
-    # "GBPUSD.ecn",
-    # "NZDCAD.ecn",
-    # "NZDUSD.ecn",
-    # "NZDCHF.ecn",
-    # "USDCAD.ecn",
-    # "USDCHF.ecn",
+    "EURGBP.ecn",
+    "GBPAUD.ecn",
+    "GBPCAD.ecn",
+    "GBPCHF.ecn",
+    "GBPUSD.ecn",
+    "NZDCAD.ecn",
+    "NZDUSD.ecn",
+    "NZDCHF.ecn",
+    "USDCAD.ecn",
+    "USDCHF.ecn",
 ]
 
-INITIAL_FUND = 30.0
+ENABLE_PAIR_LIST = [
+
+    "AUDCAD.ecn",
+    "AUDUSD.ecn",
+    "EURAUD.ecn",
+    "EURCAD.ecn",
+    "EURUSD.ecn",
+    "EURGBP.ecn",
+    "GBPAUD.ecn",
+    "GBPCAD.ecn",
+    "GBPUSD.ecn",
+    "NZDCAD.ecn",
+    "NZDUSD.ecn",
+    "USDCAD.ecn",
+
+]
+
+DISABLE_PAIR_LIST = [
+    pair for pair in TOTAL_PAIRS_LIST
+    if pair not in ENABLE_PAIR_LIST
+]
+
+invalid_enabled = [
+    pair for pair in ENABLE_PAIR_LIST
+    if pair not in TOTAL_PAIRS_LIST
+]
+if invalid_enabled:
+    raise ValueError(f"Invalid enabled pairs: {invalid_enabled}")
+
+PAIRS = ENABLE_PAIR_LIST.copy()
+
+
+INITIAL_FUND = 100.0
 INITIAL_RISK = 8.0
 
 DATA_DIR = "."
-START_DATE = "2026-05-15"
-END_DATE = "2026-05-15"
+START_DATE = "2026-02-01"
+END_DATE = "2026-03-01"
 
 EXPORT_NAME = f"backtest_{START_DATE}_to_{END_DATE}.xlsx"
 TIMEFRAME = mt5.TIMEFRAME_M15
+
+SHOW_FILTERED_1H_LINES = False
+SHOW_CAPTURED_ON_ERROR = True
+
+FILTER_KEYWORDS = [
+    "ATR gate check",
+    "prev1hatr",
+    "prev1HATR",
+    "prev_1h_atr",
+    "reason=prev1hatrinvalid",
+    "reason=prev_1h_atr_invalid",
+    "breakout candidate ATR gate failed",
+    "LOW pattern:",
+    "HIGH pattern:",
+]
 
 
 def pair_to_temp_csv(pair: str) -> str:
@@ -57,7 +108,7 @@ def init_mt5() -> bool:
 
 
 def fetch_pair_data(pair: str, start_date: str, end_date: str) -> bool:
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=7)
     end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
 
     print(f"\n[{pair}] Fetching data from {start_dt.date()} to {end_dt.date()}")
@@ -130,16 +181,151 @@ def build_specs(data_dir: str, pairs: list[str]) -> list[dict]:
     return specs
 
 
+def enrich_prev_h1_time(line: str) -> str:
+    prev_time_match = re.search(
+        r"prev1htime([0-9:\-\s]+)", line, flags=re.IGNORECASE)
+    if not prev_time_match:
+        prev_time_match = re.search(
+            r"prev_1h_time=([0-9:\-\s]+)", line, flags=re.IGNORECASE)
+
+    if not prev_time_match:
+        return line
+
+    prev_time = prev_time_match.group(1).strip()
+
+    if "prev1HATR" in line and "(time=" not in line:
+        line = re.sub(
+            r"(prev1HATR[0-9\.]+)",
+            rf"\1 (time={prev_time})",
+            line,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    if "prev_1H_ATR=" in line and "(time=" not in line:
+        line = re.sub(
+            r"(prev_1H_ATR=[0-9\.]+)",
+            rf"\1 (time={prev_time})",
+            line,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    if "prev_1h_atr=" in line and "(time=" not in line:
+        line = re.sub(
+            r"(prev_1h_atr=[0-9\.]+)",
+            rf"\1 (time={prev_time})",
+            line,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    return line
+
+
+def print_filtered_output(text: str):
+    if not SHOW_FILTERED_1H_LINES:
+        return
+
+    seen = set()
+    last_prev_1h_time = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        m = re.search(r"prev1htime([0-9:\-\s]+)", line, flags=re.IGNORECASE)
+        if not m:
+            m = re.search(
+                r"prev_1h_time=([0-9:\-\s]+)", line, flags=re.IGNORECASE)
+        if m:
+            last_prev_1h_time = m.group(1).strip()
+
+        if any(keyword.lower() in line.lower() for keyword in FILTER_KEYWORDS):
+            if (
+                last_prev_1h_time
+                and "(time=" not in line
+                and ("prev1HATR" in line or "prev_1H_ATR=" in line or "prev_1h_atr=" in line)
+            ):
+                if "prev1HATR" in line:
+                    line = re.sub(
+                        r"(prev1HATR[0-9\.]+)",
+                        rf"\1 (time={last_prev_1h_time})",
+                        line,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+                elif "prev_1H_ATR=" in line:
+                    line = re.sub(
+                        r"(prev_1H_ATR=[0-9\.]+)",
+                        rf"\1 (time={last_prev_1h_time})",
+                        line,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+                elif "prev_1h_atr=" in line:
+                    line = re.sub(
+                        r"(prev_1h_atr=[0-9\.]+)",
+                        rf"\1 (time={last_prev_1h_time})",
+                        line,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+
+            line = enrich_prev_h1_time(line)
+
+            if line not in seen:
+                print(line)
+                seen.add(line)
+
+
+def run_with_filtered_stdout(func, *args, **kwargs):
+    buffer = io.StringIO()
+
+    try:
+        with redirect_stdout(buffer):
+            result = func(*args, **kwargs)
+
+        captured = buffer.getvalue()
+        print_filtered_output(captured)
+        return result
+
+    except Exception:
+        captured = buffer.getvalue()
+
+        if captured.strip():
+            print_filtered_output(captured)
+
+        if SHOW_CAPTURED_ON_ERROR and captured.strip():
+            print("\n" + "=" * 70)
+            print("CAPTURED INTERNAL OUTPUT BEFORE ERROR")
+            print("=" * 70)
+            print(captured[-12000:])
+            print("=" * 70)
+
+        raise
+
+
 def main():
     if not init_mt5():
         raise RuntimeError("MT5 not initialized. Open MT5 and login first.")
 
     try:
+        print("\n" + "=" * 70)
+        print("PAIR CONFIGURATION")
+        print("=" * 70)
+        print(f"Total pairs   : {len(TOTAL_PAIRS_LIST)}")
+        print(f"Enabled pairs : {len(ENABLE_PAIR_LIST)} -> {ENABLE_PAIR_LIST}")
+        print(
+            f"Disabled pairs: {len(DISABLE_PAIR_LIST)} -> {DISABLE_PAIR_LIST}")
+
         updated_pairs = refresh_csv_data(PAIRS, START_DATE, END_DATE)
 
         if not updated_pairs:
             raise RuntimeError(
-                "No pair data fetched from MT5 for selected date range.")
+                "No pair data fetched from MT5 for selected date range."
+            )
 
         engine = BacktestEngine1HORB(
             initial_fund=INITIAL_FUND,
@@ -154,7 +340,8 @@ def main():
 
         if not specs:
             raise RuntimeError(
-                "No matching CSV files found for selected pairs.")
+                "No matching CSV files found for selected pairs."
+            )
 
         print("\n" + "=" * 70)
         print("RUNNING BACKTEST")

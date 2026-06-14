@@ -1,3 +1,5 @@
+# live_data_mt5.py
+
 import MetaTrader5 as mt5
 import pandas as pd
 from datetime import datetime, timedelta
@@ -7,7 +9,7 @@ def _ensure_mt5_connected():
     info = mt5.terminal_info()
     if info is None:
         raise RuntimeError(
-            "MT5 terminal not initialized. Call init_mt5() before fetch functions."
+            "MT5 terminal not initialized. Call mt5.initialize() before fetch functions."
         )
 
 
@@ -59,7 +61,6 @@ def fetch_live_1m(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
 def fetch_live_15m(symbol: str, lookback_days: int = 90) -> pd.DataFrame:
     """
     Latest 15M OHLC MT5 se lao using copy_rates_from_pos.
-    Yeh recent bars uthata hai, isliye Monday/history lag case me zyada useful hai.
     Columns: datetime, open, high, low, close
     """
     _ensure_mt5_connected()

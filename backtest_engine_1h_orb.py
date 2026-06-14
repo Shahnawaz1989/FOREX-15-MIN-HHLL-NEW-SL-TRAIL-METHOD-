@@ -1,8 +1,10 @@
+# backtest_engine_1h_orb.py
 from strategy_calculator import StrategyCalculator
 from gann_fetcher import GannFetcher
-from live_data_mt5 import fetch_live_1m
 from live_fund_manager import get_live_usable_fund
 from backtest_orb_runner_live_style import process_pair_day_live_style
+from live_data_mt5 import fetch_live_1m
+from mt5_atr_bridge import fetch_mt5_h1_m15_atr
 import os
 import pandas as pd
 import numpy as np
@@ -18,9 +20,8 @@ from backtest_orb_runner_helpers import (
     process_pair_day,
 )
 from backtest_orb_setup_builder import (
-    build_high_setup_for_day,
-    build_low_setup_for_day,
-    select_entry_target_from_gate_and_39,
+    build_setup_for_day,
+    invalidate_pending_setup_on_new_pivot,
 )
 from backtest_orb_trade_simulator import (
     resolve_same_candle_exit_with_m1,
@@ -189,7 +190,7 @@ class BacktestEngine1HORB:
 
         # SERVER-time HH/LL disable window:
         # Detection allowed, but new order processing blocked in this window.
-        self.hhll_disable_start_server = time(19, 00)
+        self.hhll_disable_start_server = time(22, 00)
         self.hhll_disable_end_server = time(23, 45)
 
         # 🔹 Local Gann lookup load (JSON)
@@ -200,6 +201,8 @@ class BacktestEngine1HORB:
         self.max_backtest_lot = None
         self.fixed_lot_mode = False
         self.fixed_lot_value = None
+
+        self.h1_atr_df = pd.DataFrame()
 
         # summaries
         self.daily_briefings = []
@@ -223,43 +226,88 @@ class BacktestEngine1HORB:
 
     def _load_gann_lookup(self, path: str) -> Dict:
         """
-        JSON: { "1.23456": { "buy_at": ..., "buy_t1": ..., "buy_t2": ..., ..., "sell_at": ..., "sell_t1": ... } }
+        JSON: { "1.23456": { ... } }
+
+        Ab hum teen cheezein rakh rahe hain:
+        1) prices -> sorted float list (nearest fallback ke liye)
+        2) levels -> unhi prices ke level dicts
+        3) exact_map -> "0.8067" jaisi string key -> level dict
         """
         try:
             with open(path, "r") as f:
                 data = json.load(f)
 
-            items = sorted(
-                [(float(k), v) for k, v in data.items()],
-                key=lambda x: x[0]
-            )
+            exact_map: Dict[str, Dict] = {}
+            items = []
+
+            for k, v in data.items():
+                fk = float(k)
+                bucket = f"{fk:.4f}"
+                exact_map[bucket] = v
+                items.append((fk, v))
+
+            items.sort(key=lambda x: x[0])
             prices = [p for p, _ in items]
             levels = [lv for _, lv in items]
-            print(f"  -> Loaded {len(prices)} Gann lookup keys from {path}")
-            return {"prices": prices, "levels": levels}
+
+            print(f" -> Loaded {len(prices)} Gann lookup keys from {path}")
+            return {
+                "prices": prices,
+                "levels": levels,
+                "exact_map": exact_map,
+            }
         except Exception as e:
-            print(f"  -> Gann lookup load failed: {e}")
-            return {"prices": [], "levels": []}
+            print(f" -> Gann lookup load failed: {e}")
+            return {
+                "prices": [],
+                "levels": [],
+                "exact_map": {},
+            }
 
     def _get_gann_from_lookup(self, price: float) -> Optional[Dict]:
-        """
-        Nearest price lookup in forex_gann_lookup_1_3.json
-        Expect JSON structure per price key:
-        {
-          "buy_at": 1.2345,
-          "buy_t1": 1.2350,
-          "buy_t2": 1.2360,
-          "sell_at": 1.2335,
-          "sell_t1": 1.2330,
-          "sell_t2": 1.2320
-        }
-        """
-        prices = self.gann_lookup["prices"]
-        levels = self.gann_lookup["levels"]
+        prices = self.gann_lookup.get("prices", [])
+        levels = self.gann_lookup.get("levels", [])
+        exact_map = self.gann_lookup.get("exact_map", {})
+
         if not prices:
             return None
 
-        pos = bisect.bisect_left(prices, price)
+        raw_lookup_input = float(price)
+
+        bucket = f"{raw_lookup_input:.4f}"
+        if bucket in exact_map:
+            lv = exact_map[bucket]
+            matched_price = float(bucket)
+
+            buy_t1 = lv.get("buy_t1") or lv.get("buyT1")
+            buy_t2 = lv.get("buy_t2") or lv.get("buyT2")
+            sell_t1 = lv.get("sell_t1") or lv.get("sellT1")
+            sell_t2 = lv.get("sell_t2") or lv.get("sellT2")
+
+            if buy_t1 is None or buy_t2 is None or sell_t1 is None or sell_t2 is None:
+                return None
+
+            return {
+                "raw_lookup_input": raw_lookup_input,
+                "matched_price": matched_price,
+                "buy_at": lv["buy_at"],
+                "buy_targets": [buy_t1, buy_t2],
+                "sell_at": lv["sell_at"],
+                "sell_targets": [sell_t1, sell_t2],
+                "buy_t1": buy_t1,
+                "buy_t2": buy_t2,
+                "sell_t1": sell_t1,
+                "sell_t2": sell_t2,
+                "buy_sl": lv.get("buy_sl"),
+                "sell_sl": lv.get("sell_sl"),
+                "middle": lv.get("middle"),
+                "buy_super_middle": lv.get("buy_super_middle"),
+                "sell_super_middle": lv.get("sell_super_middle"),
+            }
+
+        import bisect
+
+        pos = bisect.bisect_left(prices, raw_lookup_input)
         if pos == 0:
             idx = 0
         elif pos == len(prices):
@@ -267,92 +315,78 @@ class BacktestEngine1HORB:
         else:
             before = prices[pos - 1]
             after = prices[pos]
-            idx = pos - 1 if abs(price - before) <= abs(price - after) else pos
+            idx = pos - 1 if abs(raw_lookup_input -
+                                 before) <= abs(raw_lookup_input - after) else pos
 
         lv = levels[idx]
-        nearest_price = prices[idx]
+        matched_price = prices[idx]
 
-        # Safe extraction with fallbacks
         buy_t1 = lv.get("buy_t1") or lv.get("buyT1")
         buy_t2 = lv.get("buy_t2") or lv.get("buyT2")
         sell_t1 = lv.get("sell_t1") or lv.get("sellT1")
         sell_t2 = lv.get("sell_t2") or lv.get("sellT2")
 
         if buy_t1 is None or buy_t2 is None or sell_t1 is None or sell_t2 is None:
-            print(f"  -> Missing T1/T2 keys in JSON for price {nearest_price}")
             return None
 
         return {
-            "input_price": nearest_price,
+            "raw_lookup_input": raw_lookup_input,
+            "matched_price": matched_price,
             "buy_at": lv["buy_at"],
-            "buy_targets": [buy_t1, buy_t2],   # sirf T1, T2
+            "buy_targets": [buy_t1, buy_t2],
             "sell_at": lv["sell_at"],
-            "sell_targets": [sell_t1, sell_t2],  # sirf T1, T2
+            "sell_targets": [sell_t1, sell_t2],
+            "buy_t1": buy_t1,
+            "buy_t2": buy_t2,
+            "sell_t1": sell_t1,
+            "sell_t2": sell_t2,
+            "buy_sl": lv.get("buy_sl"),
+            "sell_sl": lv.get("sell_sl"),
+            "middle": lv.get("middle"),
+            "buy_super_middle": lv.get("buy_super_middle"),
+            "sell_super_middle": lv.get("sell_super_middle"),
         }
-
-    # ------------------ ATR(14) RMA on 1H ------------------
-
-    def _add_atr_column(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add ATR(14) RMA/Wilder on 1H candles.
-        df: sorted by time (server)
-        """
-        high = df["high"].values
-        low = df["low"].values
-        close = df["close"].values
-
-        tr = np.zeros(len(df))
-        tr[0] = high[0] - low[0]
-
-        for i in range(1, len(df)):
-            hl = high[i] - low[i]
-            hc = abs(high[i] - close[i - 1])
-            lc = abs(low[i] - close[i - 1])
-            tr[i] = max(hl, hc, lc)
-
-        atr = np.zeros(len(df))
-        p = self.atr_period
-
-        if len(df) < p:
-            df["atr"] = np.nan
-            return df
-
-        # First ATR = SMA of first p TRs
-        first_atr = np.mean(tr[:p])
-        atr[p - 1] = first_atr
-
-        # Wilder RMA
-        for i in range(p, len(df)):
-            atr[i] = atr[i - 1] + (tr[i] - atr[i - 1]) / p
-
-        # first (p-1) candles ATR undefined
-        atr[:p - 1] = np.nan
-
-        df["atr"] = atr
-        return df
-
-    def _debug_atr_row(self, df: pd.DataFrame, ts):
-        row = df[df["time"] == pd.Timestamp(ts)]
-        if row.empty:
-            print(f"ATR DEBUG: no row for {ts}")
-            return
-
-        i = row.index[0]
-        prev_close = df.loc[i - 1, "close"] if i > 0 else np.nan
-        tr = max(
-            df.loc[i, "high"] - df.loc[i, "low"],
-            abs(df.loc[i, "high"] - prev_close) if pd.notna(prev_close) else 0,
-            abs(df.loc[i, "low"] - prev_close) if pd.notna(prev_close) else 0,
-        )
-
-        print(
-            f"ATR DEBUG | time={df.loc[i, 'time']} | "
-            f"high={df.loc[i, 'high']:.5f} low={df.loc[i, 'low']:.5f} "
-            f"close={df.loc[i, 'close']:.5f} prev_close={prev_close:.5f} "
-            f"TR={tr:.5f} ATR={df.loc[i, 'atr']:.5f}"
-        )
-
     # ------------------ DAY VALIDATION (basic) ------------------
+
+    def _check_atr_buffer_entry(
+        self,
+        entry_price: float,
+        side: str,
+        atr: float,
+        high: float,
+        low: float,
+        is_new_orb_shifted: bool = False,
+    ):
+        """
+        SIMPLE ENTRY TOUCH:
+
+        BUY:
+            candle high >= entry_price  -> fill
+        SELL:
+            candle low <= entry_price   -> fill
+
+        ATR ab sirf info/debug ke liye rahega; trigger pe koi effect nahi.
+        """
+        try:
+            entry_price = float(entry_price)
+            high = float(high)
+            low = float(low)
+        except Exception:
+            return None
+
+        side = str(side).upper().strip()
+
+        if side in ("BUY", "B"):
+            if high >= entry_price:
+                return entry_price
+            return None
+
+        if side in ("SELL", "S"):
+            if low <= entry_price:
+                return entry_price
+            return None
+
+        return None
 
     def _validate_day(self, day_df: pd.DataFrame) -> bool:
         """
@@ -377,48 +411,281 @@ class BacktestEngine1HORB:
 
         return True
 
-    def _select_entry_target_from_gate_and_39(
+    def _price_match_tol(self) -> float:
+        return 0.00025
+
+    def _find_mt5_pending_order_for_setup(self, pair: str, setup: Dict):
+        try:
+            import MetaTrader5 as mt5
+
+            orders = mt5.orders_get(symbol=pair)
+            if orders is None:
+                return None
+
+            side = str(setup.get("side", "")).upper().strip()
+            entry = float(setup.get("entry", 0.0))
+            sl = float(setup.get("sl", 0.0))
+            tp = float(setup.get("tp", 0.0))
+            tol = self._price_match_tol()
+
+            buy_types = {
+                mt5.ORDER_TYPE_BUY_LIMIT,
+                mt5.ORDER_TYPE_BUY_STOP,
+                mt5.ORDER_TYPE_BUY_STOP_LIMIT,
+            }
+            sell_types = {
+                mt5.ORDER_TYPE_SELL_LIMIT,
+                mt5.ORDER_TYPE_SELL_STOP,
+                mt5.ORDER_TYPE_SELL_STOP_LIMIT,
+            }
+            allowed_types = buy_types if side in {"B", "BUY"} else sell_types
+
+            for o in orders:
+                if getattr(o, "symbol", "") != pair:
+                    continue
+                if getattr(o, "type", None) not in allowed_types:
+                    continue
+
+                o_price = float(getattr(o, "price_open", 0.0) or 0.0)
+                o_sl = float(getattr(o, "sl", 0.0) or 0.0)
+                o_tp = float(getattr(o, "tp", 0.0) or 0.0)
+
+                if (
+                    abs(o_price - entry) <= tol
+                    and abs(o_sl - sl) <= tol
+                    and abs(o_tp - tp) <= tol
+                ):
+                    return o
+
+            return None
+
+        except Exception as e:
+            print(f"  -> _find_mt5_pending_order_for_setup failed: {e}")
+            return None
+
+    def _find_mt5_open_position_for_setup(self, pair: str, setup: Dict):
+        try:
+            import MetaTrader5 as mt5
+
+            positions = mt5.positions_get(symbol=pair)
+            if positions is None:
+                return None
+
+            side = str(setup.get("side", "")).upper().strip()
+            sl = float(setup.get("sl", 0.0))
+            tp = float(setup.get("tp", 0.0))
+            tol = self._price_match_tol()
+
+            expected_type = mt5.POSITION_TYPE_BUY if side in {
+                "B", "BUY"} else mt5.POSITION_TYPE_SELL
+
+            for p in positions:
+                if getattr(p, "symbol", "") != pair:
+                    continue
+                if getattr(p, "type", None) != expected_type:
+                    continue
+
+                p_sl = float(getattr(p, "sl", 0.0) or 0.0)
+                p_tp = float(getattr(p, "tp", 0.0) or 0.0)
+
+                if abs(p_sl - sl) <= tol and abs(p_tp - tp) <= tol:
+                    return p
+
+            return None
+
+        except Exception as e:
+            print(f"  -> _find_mt5_open_position_for_setup failed: {e}")
+            return None
+
+    def _has_mt5_closed_trade_for_setup(self, pair: str, day, setup: Dict) -> bool:
+        try:
+            import MetaTrader5 as mt5
+            from datetime import datetime, timedelta, time
+
+            side = str(setup.get("side", "")).upper().strip()
+            entry = float(setup.get("entry", 0.0) or 0.0)
+            sl = float(setup.get("sl", 0.0) or 0.0)
+            tp = float(setup.get("tp", 0.0) or 0.0)
+            trigger_time_raw = setup.get("trigger_time")
+            tol = float(self._price_match_tol())
+
+            print(
+                f"  -> [_has_mt5_closed_trade_for_setup] "
+                f"pair={pair} side={side} entry={entry} sl={sl} tp={tp} "
+                f"trigger_time={trigger_time_raw} tol={tol}"
+            )
+
+            if side not in {"B", "BUY", "S", "SELL"}:
+                print("     side invalid, returning False")
+                return False
+
+            day_date = pd.to_datetime(day).date()
+            day_start = datetime.combine(day_date, time(0, 0))
+            day_end = day_start + timedelta(days=1)
+
+            trigger_time = pd.to_datetime(
+                trigger_time_raw) if trigger_time_raw is not None else day_start
+            open_time_min = trigger_time - timedelta(minutes=5)
+
+            print(
+                f"     day_date={day_date} day_start={day_start} "
+                f"day_end={day_end} open_time_min={open_time_min}"
+            )
+
+            deals = mt5.history_deals_get(
+                day_start - timedelta(days=1), day_end, group=pair)
+            if deals is None:
+                print("     no deals returned from history_deals_get, returning False")
+                return False
+
+            deals = [d for d in deals if getattr(d, "symbol", "") == pair]
+            print(
+                f"     total deals for {pair} in window (prev_day->today_end) = {len(deals)}")
+
+            if not deals:
+                return False
+
+            expected_open_type = mt5.DEAL_TYPE_BUY if side in {
+                "B", "BUY"} else mt5.DEAL_TYPE_SELL
+            candidate_positions = []
+
+            for d in deals:
+                d_type = getattr(d, "type", None)
+                d_entry_flag = getattr(d, "entry", None)
+                d_time_val = getattr(d, "time", None)
+                d_price = float(getattr(d, "price", 0.0) or 0.0)
+                d_sl = float(getattr(d, "sl", 0.0) or 0.0)
+                d_tp = float(getattr(d, "tp", 0.0) or 0.0)
+                position_id = int(getattr(d, "position_id", 0) or 0)
+                deal_ticket = int(getattr(d, "ticket", 0) or 0)
+
+                d_open_time = (
+                    pd.to_datetime(d_time_val, unit="s", errors="coerce")
+                    if d_time_val is not None
+                    else None
+                )
+
+                print(
+                    "     [deal] "
+                    f"ticket={deal_ticket} pos_id={position_id} type={d_type} "
+                    f"entry_flag={d_entry_flag} time={d_open_time} "
+                    f"price={d_price} sl={d_sl} tp={d_tp}"
+                )
+
+                if d_type != expected_open_type:
+                    continue
+
+                if d_entry_flag is not None and d_entry_flag != mt5.DEAL_ENTRY_IN:
+                    continue
+
+                if d_open_time is None or pd.isna(d_open_time):
+                    continue
+
+                if d_open_time.date() != day_date:
+                    continue
+
+                if d_open_time < open_time_min:
+                    continue
+
+                entry_match = abs(d_price - entry) <= tol
+                sl_match = (d_sl == 0.0 or abs(d_sl - sl) <= tol)
+                tp_match = (d_tp == 0.0 or abs(d_tp - tp) <= tol)
+
+                print(
+                    f"        candidate check: "
+                    f"entry_match={entry_match} sl_match={sl_match} tp_match={tp_match}"
+                )
+
+                if entry_match and sl_match and tp_match and position_id > 0:
+                    print(
+                        "        -> CANDIDATE OPEN MATCH: "
+                        f"position_id={position_id} ticket={deal_ticket} open_time={d_open_time}"
+                    )
+                    candidate_positions.append(
+                        (position_id, deal_ticket, d_open_time))
+
+            if not candidate_positions:
+                print("     no candidate opening positions matched, returning False")
+                return False
+
+            for position_id, open_ticket, matched_open_time in candidate_positions:
+                print(
+                    f"     scanning for close deals on position_id={position_id} "
+                    f"(open_ticket={open_ticket})"
+                )
+                for d in deals:
+                    d_position_id = int(getattr(d, "position_id", 0) or 0)
+                    d_ticket = int(getattr(d, "ticket", 0) or 0)
+                    d_entry_flag = getattr(d, "entry", None)
+                    d_time_val = getattr(d, "time", None)
+
+                    if d_position_id != position_id:
+                        continue
+                    if d_ticket == open_ticket:
+                        continue
+
+                    d_close_time = (
+                        pd.to_datetime(d_time_val, unit="s", errors="coerce")
+                        if d_time_val is not None
+                        else None
+                    )
+
+                    print(
+                        "        [close-scan] "
+                        f"ticket={d_ticket} pos_id={d_position_id} "
+                        f"entry_flag={d_entry_flag} close_time={d_close_time}"
+                    )
+
+                    if d_entry_flag not in {
+                        mt5.DEAL_ENTRY_OUT,
+                        mt5.DEAL_ENTRY_OUT_BY,
+                        mt5.DEAL_ENTRY_INOUT,
+                    }:
+                        continue
+                    if d_close_time is None or pd.isna(d_close_time):
+                        continue
+                    if d_close_time.date() != day_date:
+                        continue
+                    if d_close_time < matched_open_time:
+                        continue
+
+                    print(
+                        "        -> CONFIRMED CLOSED POSITION: "
+                        f"position_id={position_id} open={matched_open_time} close={d_close_time}"
+                    )
+                    return True
+
+            print(
+                "     no confirmed closed positions for matched candidates, returning False")
+            return False
+
+        except Exception as e:
+            print(f"  -> _has_mt5_closed_trade_for_setup failed: {e}")
+            return False
+
+    def _build_setup_for_day(
         self,
-        side: str,
-        gate_touched: bool,
-        r39_touched: bool,
-        at: float,
-        t1: float,
-        t15: float,
+        day_df: pd.DataFrame,
+        fund: float,
+        risk_percent: float,
+        gap_info: Optional[Dict] = None,
+    ):
+        return build_setup_for_day(
+            engine=self,
+            day_df=day_df,
+            fund=fund,
+            risk_percent=risk_percent,
+            gap_info=gap_info,
+        )
+
+    def _invalidate_pending_setup_on_new_pivot(
+        self,
+        setup: Optional[Dict],
+        intraday_df: pd.DataFrame,
     ) -> Dict:
-        return select_entry_target_from_gate_and_39(
-            side=side,
-            gate_touched=gate_touched,
-            r39_touched=r39_touched,
-            at=at,
-            t1=t1,
-            t15=t15,
-        )
-
-    def _build_low_setup_for_day(
-        self,
-        day_df: pd.DataFrame,
-        fund: float,
-        risk_percent: float,
-    ) -> Optional[Dict]:
-        return build_low_setup_for_day(
-            engine=self,
-            day_df=day_df,
-            fund=fund,
-            risk_percent=risk_percent,
-        )
-
-    def _build_high_setup_for_day(
-        self,
-        day_df: pd.DataFrame,
-        fund: float,
-        risk_percent: float,
-    ) -> Optional[Dict]:
-        return build_high_setup_for_day(
-            engine=self,
-            day_df=day_df,
-            fund=fund,
-            risk_percent=risk_percent,
+        return invalidate_pending_setup_on_new_pivot(
+            setup=setup,
+            intraday_df=intraday_df,
         )
 
     def _wait_for_entry_in_window(
@@ -432,15 +699,19 @@ class BacktestEngine1HORB:
         """
         Generic entry window on SERVER time.
 
-        STRICT ATR BUFFER MODE:
-        - Session ORB ka ATR use hoga
-        - Buffer formula _check_atr_buffer_entry ke hisaab se apply hoga
-        - Buffer hit nahi hua to entry nahi hogi
-        - Direct touch fallback DISABLED
-        """
-        entry_price = float(setup["entry"])
-        side = setup["side"]
+        SIMPLE ENTRY TOUCH MODE:
+        - BUY: candle high >= entry_price -> fill
+        - SELL: candle low <= entry_price -> fill
 
+        RULE:
+        - Har candle pe pehle entry touch check hoga,
+          agar fill nahi hua tabhi pending invalidation check hoga.
+        """
+
+        entry_price = float(setup["entry"])
+        side = str(setup["side"]).upper().strip()
+
+        print("  -> DEBUG: USING NEW _wait_for_entry_in_window V2")
         print(
             f"  -> Entry window (server): {window_start_server} to {window_end_server}"
         )
@@ -455,36 +726,51 @@ class BacktestEngine1HORB:
             print("  -> No candles in entry window (pending expires)")
             return None
 
-        if session_atr is None or session_atr <= 0:
-            print("  -> Invalid session ATR, buffer entry disabled for this session")
-            return None
-
         for idx in search_df.index:
             row = day_df.loc[idx]
             row_time = row["time"]
             high = float(row["high"])
             low = float(row["low"])
 
-            actual_entry = self._check_atr_buffer_entry(
-                entry_price=entry_price,
-                side=side,
-                atr=session_atr,
-                high=high,
-                low=low,
-                is_new_orb_shifted=False,
+            # 1) SIMPLE ENTRY TOUCH LOGIC (fill priority)
+            if side in ("BUY", "B"):
+                if high >= entry_price:
+                    print(
+                        f"  -> {side} entry HIT at {row_time}, "
+                        f"actual_entry={entry_price:.5f}"
+                    )
+                    return {
+                        "entry_idx": idx,
+                        "entry_time": row_time,
+                        "actual_entry": entry_price,
+                    }
+
+            elif side in ("SELL", "S"):
+                if low <= entry_price:
+                    print(
+                        f"  -> {side} entry HIT at {row_time}, "
+                        f"actual_entry={entry_price:.5f}"
+                    )
+                    return {
+                        "entry_idx": idx,
+                        "entry_time": row_time,
+                        "actual_entry": entry_price,
+                    }
+
+            # 2) AGAR FILL NAHIN HUA, TABHI PENDING INVALIDATION
+            partial_df = day_df.loc[day_df["time"] <= row_time].copy()
+            chk = self._invalidate_pending_setup_on_new_pivot(
+                setup=setup,
+                intraday_df=partial_df,
             )
-
-            if actual_entry is not None:
+            if chk.get("cancelled"):
                 print(
-                    f"  -> {side} ATR-buffer entry hit at {row_time}, actual_entry={actual_entry:.5f}"
+                    f"  -> {side} pending CANCELLED before fill at {row_time} "
+                    f"| reason={chk.get('reason')}"
                 )
-                return {
-                    "entry_idx": idx,
-                    "entry_time": row_time,
-                    "actual_entry": actual_entry,
-                }
+                return None
 
-        print(f"  -> {side} pending not filled with ATR buffer in this session")
+        print(f"  -> {side} pending not filled in this session")
         return None
 
     def _wait_for_first_fill_in_window_session(
@@ -642,6 +928,48 @@ class BacktestEngine1HORB:
 
                 week_num, risk_percent = get_weekly_risk_percent(self, day)
                 day_risk_percent = risk_percent
+
+                bridge_data = fetch_mt5_h1_m15_atr(
+                    symbol=pair,
+                    day=datetime.strptime(str(day), "%Y-%m-%d"),
+                    atr_period=self.atr_period,
+                    timeout_sec=30,
+                )
+
+                h1atr = bridge_data.get("h1")
+                m15atr = bridge_data.get("m15")
+
+                if h1atr is None or h1atr.empty:
+                    print(
+                        f" -> No MT5 1H ATR data for {pair} on {day}, skipping")
+                    continue
+
+                self.h1_atr_df = h1atr.copy()
+                self.h1_atr_df["time"] = pd.to_datetime(
+                    self.h1_atr_df["time"], errors="coerce")
+                self.h1_atr_df["atr"] = pd.to_numeric(
+                    self.h1_atr_df["atr"], errors="coerce")
+                self.h1_atr_df = (
+                    self.h1_atr_df
+                    .dropna(subset=["time", "atr"])
+                    .sort_values("time")
+                    .reset_index(drop=True)
+                )
+                self.h1atrdf = self.h1_atr_df.copy()
+
+                df = df.copy()
+                df["time"] = pd.to_datetime(df["time"], errors="coerce")
+
+                if m15atr is not None and not m15atr.empty:
+                    m15 = m15atr.copy()
+                    m15["time"] = pd.to_datetime(m15["time"], errors="coerce")
+                    m15["atr"] = pd.to_numeric(m15["atr"], errors="coerce")
+                    df = df.merge(
+                        m15[["time", "atr"]],
+                        on="time",
+                        how="left",
+                        suffixes=("", "_m15_bridge"),
+                    )
 
                 trades = process_pair_day_live_style(self, day, pair, df)
 
@@ -912,8 +1240,8 @@ class BacktestEngine1HORB:
             build_live_cancel_payload_fn=lambda **kwargs: self._build_live_cancel_payload(
                 **kwargs),
             write_live_signal_file_fn=lambda signal_file, payload: self._write_live_signal_file(
-                signal_file, payload),
-            mark_signal_non_completed_in_registry_fn=self._mark_signal_non_completed_in_registry,
+                signal_file, payload
+            ),
             terminal_filled_statuses=TERMINAL_FILLED_STATUSES,
             pair=pair,
             day=day,
@@ -922,11 +1250,7 @@ class BacktestEngine1HORB:
             max_spread_points=max_spread_points,
             max_slippage_points=max_slippage_points,
             reason=reason,
-            pre_cancel_finalize_fn=lambda signal_id: self._finalize_signal_from_market_before_cancel(
-                signal_id=signal_id,
-                pair=pair,
-                day=day,
-            ),
+            pre_cancel_finalize_fn=None,
         )
 
     def _write_fresh_signal_after_strict_delete(
@@ -942,18 +1266,15 @@ class BacktestEngine1HORB:
         reason: str = "CANCELLEDNEWHHLL",
     ):
         return write_fresh_signal_after_strict_delete(
-            load_live_registry_fn=self._load_live_registry,
-            has_active_registry_signal_for_pair_day_side_fn=self._has_active_registry_signal_for_pair_day_side,
-            make_signal_id_from_setup_fn=self._make_signal_id_from_setup,
-            is_signal_completed_in_registry_fn=self._is_signal_completed_in_registry,
-            is_same_completed_trade_prices_fn=self._is_same_completed_trade_prices,
             build_live_place_payload_fn=lambda **kwargs: self._build_live_place_payload(
                 **kwargs),
             is_same_live_payload_fn=self._is_same_live_payload,
             cancel_existing_signal_strict_fn=lambda **kwargs: self._cancel_existing_signal_strict(
-                **kwargs),
+                **kwargs
+            ),
             write_live_signal_file_fn=lambda signal_file, payload: self._write_live_signal_file(
-                signal_file, payload),
+                signal_file, payload
+            ),
             active_file_statuses=ACTIVE_FILE_STATUSES,
             terminal_filled_statuses=TERMINAL_FILLED_STATUSES,
             pair=pair,
@@ -998,10 +1319,6 @@ class BacktestEngine1HORB:
         return build_live_place_payload(
             fmt_live_ts_fn=self._fmt_live_ts,
             make_signal_id_from_setup_fn=self._make_signal_id_from_setup,
-            is_signal_completed_in_registry_fn=self._is_signal_completed_in_registry,
-            is_same_completed_trade_prices_fn=self._is_same_completed_trade_prices,
-            load_live_registry_fn=self._load_live_registry,
-            save_live_registry_fn=self._save_live_registry,
             live_signal_expiry_server_fn=self._live_signal_expiry_server,
             pair=pair,
             day=day,
@@ -1062,7 +1379,6 @@ class BacktestEngine1HORB:
         total_trades = len(self.trades)
         net_pnl = self.current_fund - self.initial_fund
 
-        # Result counts
         wins = sum(1 for t in self.trades if t["result"] == "tp")
         sl_lock10 = sum(1 for t in self.trades if t["result"] == "sl_lock10")
         losses = sum(1 for t in self.trades if t["result"] == "sl")
@@ -1109,31 +1425,26 @@ class BacktestEngine1HORB:
             if self.trades:
                 trades_df = pd.DataFrame(self.trades)
 
-                # Ensure columns exist for backward compatibility
                 if "entry_mode" not in trades_df.columns:
                     trades_df["entry_mode"] = ""
 
                 if "sl_mode" not in trades_df.columns:
                     trades_df["sl_mode"] = "NORMAL"
 
-                # Entry From column from entry_mode
                 trades_df["Entry From"] = trades_df["entry_mode"].apply(
                     lambda x: "T1" if isinstance(x, str) and x.endswith("_T1")
                     else ("AT" if isinstance(x, str) and x.endswith("_AT") else "")
                 )
 
-                # Put "Entry From" right after entry_price
                 if "entry_price" in trades_df.columns:
                     insert_pos = trades_df.columns.get_loc("entry_price") + 1
                     col = trades_df.pop("Entry From")
                     trades_df.insert(insert_pos, "Entry From", col)
 
-                # Optional: make sl_mode column display-friendly
                 trades_df["SL Mode"] = trades_df["sl_mode"].apply(
                     lambda x: "SL_LOCK10" if x == "LOCK10_TP80" else "NORMAL"
                 )
 
-                # Optional column ordering for readability
                 preferred_order = [
                     "date",
                     "pair",
@@ -1172,27 +1483,20 @@ class BacktestEngine1HORB:
             if hasattr(self, "daily_briefings") and self.daily_briefings:
                 daily_df = pd.DataFrame(self.daily_briefings)
 
-                expected_cols = [
-                    "date",
-                    "open_balance",
-                    "risk_percent",
-                    "no_trades",
-                    "tp_hits",
-                    "max_lot",
-                    "profit",
-                    "final_balance",
-                ]
+                rename_map = {
+                    "date": "Date",
+                    "open_balance": "Open Balance",
+                    "risk_percent": "Risk %",
+                    "trade_count": "No Trades",
+                    "tp_hits": "TP Hits",
+                    "max_lot": "Max Lot",
+                    "profit": "Profit",
+                    "close_balance": "Final Balance",
+                }
 
-                for col in expected_cols:
-                    if col not in daily_df.columns:
-                        if col == "max_lot":
-                            daily_df[col] = 0.0
-                        else:
-                            daily_df[col] = None
+                daily_df = daily_df.rename(columns=rename_map)
 
-                daily_df = daily_df[expected_cols]
-
-                daily_df.columns = [
+                ordered_cols = [
                     "Date",
                     "Open Balance",
                     "Risk %",
@@ -1203,8 +1507,13 @@ class BacktestEngine1HORB:
                     "Final Balance",
                 ]
 
+                for col in ordered_cols:
+                    if col not in daily_df.columns:
+                        daily_df[col] = 0.0
+
+                daily_df = daily_df[ordered_cols]
+
                 daily_df.to_excel(
-                    writer, sheet_name="Day Wise Briefing", index=False
-                )
+                    writer, sheet_name="Day Wise Briefing", index=False)
 
         print(f"\nBacktest results exported to: {full_path}")
