@@ -15,7 +15,18 @@ HEARTBEAT_FILE = r"C:\trading_bot\heartbeats\live_runner_heartbeat.json"
 
 PAIRS = [
 
+    "AUDCAD.ecn",
+    "AUDUSD.ecn",
+    "EURAUD.ecn",
+    "EURCAD.ecn",
     "EURUSD.ecn",
+    "EURGBP.ecn",
+    "GBPAUD.ecn",
+    "GBPCAD.ecn",
+    "GBPUSD.ecn",
+    "NZDCAD.ecn",
+    "NZDUSD.ecn",
+    "USDCAD.ecn",
 
 ]
 

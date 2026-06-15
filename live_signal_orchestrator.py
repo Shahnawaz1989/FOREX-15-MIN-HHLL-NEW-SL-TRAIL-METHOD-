@@ -111,7 +111,8 @@ def generate_live_dual_signals_for_latest_day(
             df = engine._add_atr_column(df)
         else:
             raise ValueError(
-                "df_15m must contain atr column or engine must provide _add_atr_column")
+                "df_15m must contain atr column or engine must provide _add_atr_column"
+            )
 
     day = df["time"].dt.date.max()
     day_df = df[df["time"].dt.date == day].copy()
@@ -181,7 +182,7 @@ def generate_live_dual_signals_for_latest_day(
     print(f"  -> Live sizing fund selected = {fund:.2f}")
     risk_percent = engine.base_risk_percent
 
-    setup = engine._build_setup_for_day(day_df, fund, risk_percent)
+    setup = choose_live_setup_for_day(engine, day_df, fund, risk_percent)
 
     buy_setup = None
     sell_setup = None
@@ -205,22 +206,31 @@ def generate_live_dual_signals_for_latest_day(
         "active_row": None,
     }
 
+    chosen_setups = []
     if setup:
-        side = str(setup.get("side", "")).upper().strip()
+        if isinstance(setup, dict) and "chosen_setups" in setup:
+            chosen_setups = setup.get("chosen_setups") or []
+        elif isinstance(setup, list):
+            chosen_setups = setup
+        elif isinstance(setup, dict) and setup.get("side"):
+            chosen_setups = [setup]
 
-        if side in {"BUY", "B"}:
-            buy_state = evaluate_setup_state(engine, pair, day, "B", setup)
+    for one_setup in chosen_setups:
+        side = str(one_setup.get("side", "")).upper().strip()
+
+        if side in {"BUY", "B"} and buy_setup is None:
+            buy_state = evaluate_setup_state(engine, pair, day, "B", one_setup)
             buy_setup = None if buy_state["suppressed"] else buy_state["setup"]
 
-        elif side in {"SELL", "S"}:
-            sell_state = evaluate_setup_state(engine, pair, day, "S", setup)
+        elif side in {"SELL", "S"} and sell_setup is None:
+            sell_state = evaluate_setup_state(
+                engine, pair, day, "S", one_setup)
             sell_setup = None if sell_state["suppressed"] else sell_state["setup"]
 
     buy_payload = None
     sell_payload = None
 
     if buy_setup:
-        print(f"[GEN DBG] {pair} BUY setup = {buy_setup}")
         buy_payload = engine._write_fresh_signal_after_strict_delete(
             pair=pair,
             day=day,
@@ -232,7 +242,6 @@ def generate_live_dual_signals_for_latest_day(
             max_slippage_points=max_slippage_points,
             reason="CANCELLEDNEWHHLL",
         )
-        print(f"[GEN DBG] {pair} BUY payload returned = {buy_payload}")
     else:
         if buy_state["suppressed"] and buy_state.get("suppression_reason") in {
             "MT5_HISTORY_CLOSED",
@@ -256,7 +265,6 @@ def generate_live_dual_signals_for_latest_day(
                 )
 
     if sell_setup:
-        print(f"[GEN DBG] {pair} SELL setup = {sell_setup}")
         sell_payload = engine._write_fresh_signal_after_strict_delete(
             pair=pair,
             day=day,
@@ -268,7 +276,6 @@ def generate_live_dual_signals_for_latest_day(
             max_slippage_points=max_slippage_points,
             reason="CANCELLEDNEWHHLL",
         )
-        print(f"[GEN DBG] {pair} SELL payload returned = {sell_payload}")
     else:
         if sell_state["suppressed"] and sell_state.get("suppression_reason") in {
             "MT5_HISTORY_CLOSED",
